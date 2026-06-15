@@ -37,6 +37,21 @@ terraform plan
 terraform apply
 ```
 
+If a previous apply failed while creating the managed node group with
+`NodeCreationFailure`, delete the failed node group and apply again:
+
+```bash
+aws eks list-nodegroups --region us-east-1 --cluster-name kscluster
+aws eks delete-nodegroup --region us-east-1 --cluster-name kscluster --nodegroup-name general
+aws eks wait nodegroup-deleted --region us-east-1 --cluster-name kscluster --nodegroup-name general
+
+terraform apply
+```
+
+If your failed node group has a generated name such as
+`general-2026061509201577870000000b`, use that exact name in the delete and wait
+commands.
+
 ## 3. Configure kubectl
 
 ```bash
