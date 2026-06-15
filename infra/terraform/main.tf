@@ -45,10 +45,10 @@ module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "21.19.0"
 
-  cluster_name    = var.cluster_name
-  cluster_version = var.cluster_version
+  name               = var.cluster_name
+  kubernetes_version = var.cluster_version
 
-  cluster_endpoint_public_access = true
+  endpoint_public_access = true
 
   authentication_mode                      = "API_AND_CONFIG_MAP"
   enable_cluster_creator_admin_permissions = true
@@ -60,7 +60,7 @@ module "eks" {
     enabled = false
   }
 
-  cluster_addons = {
+  addons = {
     coredns = {
       most_recent                 = true
       resolve_conflicts_on_create = "OVERWRITE"
