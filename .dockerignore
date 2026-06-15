@@ -1,0 +1,12 @@
+.git
+.streamlit/secrets.toml
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+chatlite_data.json
+chatlite_data.sqlite3
+*.sqlite3
+.DS_Store

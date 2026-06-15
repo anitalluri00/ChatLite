@@ -1,0 +1,6 @@
+cryptography>=42.0.0
+phonenumbers>=8.13.0
+psycopg[binary]>=3.2.0
+pycountry>=24.6.1
+streamlit>=1.55.0
+watchdog>=6.0.0
