@@ -12,22 +12,41 @@ SQLite/PostgreSQL-ready storage.
 - Private chats between accepted friends
 - Group chats with admin member management
 - Encrypted message storage for chats
+- Encryption key rotation with legacy-message readability
 - Unread message badges
 - Online, offline, and last-seen status
 - Typing indicator
 - Sent, delivered, and read receipts
 - Edit and delete sent messages
 - Image, audio, video, PDF, and document sharing
+- Attachment deduplication and compressed media storage
 - Search chats and search inside the selected chat
 - Light/dark theme and accent color preference
 - Pin and archive chats
 - Block and report users
 - In-app unread notifications
+- Smart notifications for important unread chats
+- Versioned backup and restore
 - Profile photo upload
 - Mail ID and contact number
 - Country-code dropdown for supported regions
 - SQLite storage by default, JSON import fallback, and PostgreSQL support
 - Local PC, cloud VM, PaaS, and Docker deployment support
+
+## Algorithms Added
+
+- Message search ranking by exact match, sender match, frequency, and latest activity
+- Unread priority sorting by pinned status, unread count, latest activity, and online status
+- Spam detection and content moderation for repeated text, link floods, suspicious URLs, and blocked words
+- Rate limiting for messages, login attempts, password resets, and friend requests
+- Friend and group recommendations using mutual friends, shared groups, and recent activity
+- Typing debounce to reduce storage writes while users type
+- Read receipt state machine: sent, delivered, read, edited, and deleted
+- Role-based group permissions: owner, admin, member, and muted member
+- Message/media compression, attachment hashing, and duplicate payload reuse
+- Smart notifications using unread count, pinned chats, mentions, and priority keywords
+- Versioned backups with retention and timestamp restore
+- Local chat summarization for long or unread conversations
 
 ## Local Run
 
@@ -113,6 +132,51 @@ Open:
 http://localhost:8501
 ```
 
+## Kubernetes And Terraform
+
+Structured deployment files are in:
+
+```text
+infra/
+  README.md
+  k8s/                  Kubernetes manifests for ChatLite
+  terraform/            AWS EKS Terraform foundation
+    k8s-app/            Optional Terraform app deployment
+```
+
+Terraform-first AWS EKS quick start:
+
+```bash
+cd infra/terraform
+cp terraform.tfvars.example terraform.tfvars
+terraform init
+terraform validate
+terraform plan
+terraform apply
+
+aws eks update-kubeconfig --region us-east-1 --name kscluster
+```
+
+Build and push the image after EKS/ECR is created:
+
+```bash
+cd "/Users/anirudhtalluri/Documents/tab chating"
+export IMAGE_URL="$(terraform -chdir=infra/terraform output -raw ecr_repository_url):latest"
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "$(echo "$IMAGE_URL" | cut -d/ -f1)"
+docker build -t "$IMAGE_URL" .
+docker push "$IMAGE_URL"
+```
+
+Deploy the app:
+
+```bash
+# Edit infra/k8s/secret.yaml and infra/k8s/deployment.yaml first.
+kubectl apply -k infra/k8s
+kubectl -n chatlite port-forward svc/chatlite 8501:80
+```
+
+See `infra/README.md` for the full deployment notes.
+
 ## Cloud Or Server Run
 
 Most cloud platforms provide a `PORT` environment variable. This project includes
@@ -139,3 +203,6 @@ or cloud security group.
 - `Procfile` works with PaaS providers that use web process commands.
 - `runtime.txt` pins Python 3.11.9 for platforms that support it.
 - `.gitignore` ignores generated local data and Python cache files.
+- `infra/k8s` contains Kubernetes manifests.
+- `infra/terraform` contains AWS EKS Terraform.
+- `infra/terraform/k8s-app` contains optional app Terraform for existing clusters.

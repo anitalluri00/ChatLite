@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chatlite-config
+  namespace: chatlite
+  labels:
+    app.kubernetes.io/name: chatlite
+data:
+  PORT: "8501"
+  STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
+  STREAMLIT_SERVER_HEADLESS: "true"
+  CHATLITE_SQLITE_FILE: "/app/data/chatlite_data.sqlite3"

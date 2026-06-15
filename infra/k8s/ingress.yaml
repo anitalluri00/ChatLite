@@ -1,0 +1,20 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chatlite
+  namespace: chatlite
+  labels:
+    app.kubernetes.io/name: chatlite
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: chatlite.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: chatlite
+                port:
+                  number: 80

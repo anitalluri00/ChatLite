@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chatlite
+  namespace: chatlite
+  labels:
+    app.kubernetes.io/name: chatlite
+    app.kubernetes.io/component: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chatlite
+      app.kubernetes.io/component: web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chatlite
+        app.kubernetes.io/component: web
+    spec:
+      containers:
+        - name: chatlite
+          image: chatlite:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8501
+          envFrom:
+            - configMapRef:
+                name: chatlite-config
+            - secretRef:
+                name: chatlite-secret
+          volumeMounts:
+            - name: chatlite-data
+              mountPath: /app/data
+          readinessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: chatlite-data
+          persistentVolumeClaim:
+            claimName: chatlite-data

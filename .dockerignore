@@ -9,4 +9,9 @@ env/
 chatlite_data.json
 chatlite_data.sqlite3
 *.sqlite3
+**/.terraform/
+**/terraform.tfvars
+**/*.auto.tfvars
+**/*.tfstate
+**/*.tfstate.*
 .DS_Store

@@ -1,0 +1,32 @@
+aws_region      = "us-east-1"
+cluster_name    = "kscluster"
+cluster_version = "1.36"
+environment     = "production"
+
+vpc_name = "eks-vpc"
+vpc_cidr = "10.0.0.0/16"
+
+availability_zones = [
+  "us-east-1a",
+  "us-east-1b",
+]
+
+private_subnets = [
+  "10.0.1.0/24",
+  "10.0.2.0/24",
+]
+
+public_subnets = [
+  "10.0.101.0/24",
+  "10.0.102.0/24",
+]
+
+node_instance_types = ["t3.large"]
+node_min_size       = 2
+node_max_size       = 6
+node_desired_size   = 3
+node_disk_size      = 50
+
+create_ecr_repository       = true
+ecr_repository_name         = "chatlite"
+force_delete_ecr_repository = false
