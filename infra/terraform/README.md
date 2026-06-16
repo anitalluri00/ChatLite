@@ -7,7 +7,6 @@ This folder creates the AWS foundation first:
 - EKS cluster
 - EKS managed node group
 - EKS add-ons
-- Optional ECR repository for the ChatLite Docker image
 
 The defaults match the requested production setup:
 
@@ -61,23 +60,17 @@ kubectl get nodes
 
 ## 4. Build And Push ChatLite Image
 
-Get the repository URL:
+Log in to Docker Hub without saving the password in files:
 
 ```bash
-terraform output -raw ecr_repository_url
-```
-
-Log in to ECR:
-
-```bash
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "$(terraform output -raw ecr_repository_url | cut -d/ -f1)"
+docker login -u anitalluri00
 ```
 
 Build and push from the project root:
 
 ```bash
 cd ../..
-export IMAGE_URL="$(terraform -chdir=infra/terraform output -raw ecr_repository_url):latest"
+export IMAGE_URL="anitalluri00/chatlite:latest"
 docker build -t "$IMAGE_URL" .
 docker push "$IMAGE_URL"
 ```
@@ -86,8 +79,20 @@ docker push "$IMAGE_URL"
 
 Use Kubernetes manifests:
 
+If your Docker Hub repository is private, create an image pull secret first:
+
 ```bash
-sed -i.bak "s#image: chatlite:latest#image: ${IMAGE_URL}#" infra/k8s/deployment.yaml
+kubectl apply -f infra/k8s/namespace.yaml
+read -s DOCKERHUB_PASSWORD
+kubectl -n chatlite create secret docker-registry dockerhub-credentials \
+  --docker-server=https://index.docker.io/v1/ \
+  --docker-username=anitalluri00 \
+  --docker-password="$DOCKERHUB_PASSWORD"
+kubectl -n chatlite patch serviceaccount default \
+  -p '{"imagePullSecrets":[{"name":"dockerhub-credentials"}]}'
+```
+
+```bash
 kubectl apply -k infra/k8s
 kubectl -n chatlite get pods,svc,pvc,ingress
 ```

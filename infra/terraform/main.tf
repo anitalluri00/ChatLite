@@ -131,20 +131,3 @@ module "eks" {
 
   tags = local.common_tags
 }
-
-resource "aws_ecr_repository" "chatlite" {
-  count = var.create_ecr_repository ? 1 : 0
-
-  name         = var.ecr_repository_name
-  force_delete = var.force_delete_ecr_repository
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-
-  encryption_configuration {
-    encryption_type = "AES256"
-  }
-
-  tags = local.common_tags
-}

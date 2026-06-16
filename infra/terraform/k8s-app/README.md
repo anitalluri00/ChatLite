@@ -21,7 +21,7 @@ terraform apply
 Set `image` in `terraform.tfvars` to the pushed image, for example:
 
 ```hcl
-image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/chatlite:latest"
+image = "anitalluri00/chatlite:latest"
 ```
 
 Keep `replicas = 1` if you use SQLite storage. Use PostgreSQL with

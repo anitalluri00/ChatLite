@@ -11,10 +11,9 @@ infra/
 
 ## Deployment Order
 
-1. Run Terraform in `infra/terraform` to create AWS VPC, EKS, node group, add-ons,
-   and optional ECR repository.
+1. Run Terraform in `infra/terraform` to create AWS VPC, EKS, node group, and add-ons.
 2. Update kubeconfig for the new EKS cluster.
-3. Build and push the ChatLite Docker image to ECR.
+3. Build and push the ChatLite Docker image to Docker Hub.
 4. Deploy ChatLite with `kubectl apply -k infra/k8s` or Terraform in
    `infra/terraform/k8s-app`.
 
@@ -41,8 +40,8 @@ kubectl get nodes
 From the project root:
 
 ```bash
-export IMAGE_URL="$(terraform -chdir=infra/terraform output -raw ecr_repository_url):latest"
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "$(echo "$IMAGE_URL" | cut -d/ -f1)"
+docker login -u anitalluri00
+export IMAGE_URL="anitalluri00/chatlite:latest"
 docker build -t "$IMAGE_URL" .
 docker push "$IMAGE_URL"
 ```
@@ -53,8 +52,22 @@ Edit first:
 
 - `k8s/secret.yaml`: replace `CHATLITE_APP_SECRET`
 - `k8s/secret.yaml`: optionally set `CHATLITE_DATABASE_URL` for PostgreSQL
-- `k8s/deployment.yaml`: replace `image: chatlite:latest` with your ECR image
+- `k8s/deployment.yaml`: uses `anitalluri00/chatlite:latest` by default
 - `k8s/ingress.yaml`: replace `chatlite.example.com` and ingress class if needed
+
+If your Docker Hub repository is private, create an image pull secret before
+deploying:
+
+```bash
+kubectl apply -f infra/k8s/namespace.yaml
+read -s DOCKERHUB_PASSWORD
+kubectl -n chatlite create secret docker-registry dockerhub-credentials \
+  --docker-server=https://index.docker.io/v1/ \
+  --docker-username=anitalluri00 \
+  --docker-password="$DOCKERHUB_PASSWORD"
+kubectl -n chatlite patch serviceaccount default \
+  -p '{"imagePullSecrets":[{"name":"dockerhub-credentials"}]}'
+```
 
 Apply:
 
@@ -86,7 +99,7 @@ terraform plan
 terraform apply
 ```
 
-Set `image` in `terraform.tfvars` to your ECR image URL.
+Set `image` in `terraform.tfvars` to your Docker Hub image if you change the default.
 
 Keep `replicas = 1` when using SQLite. For multiple replicas, configure
 `CHATLITE_DATABASE_URL` for PostgreSQL instead of sharing one SQLite file.

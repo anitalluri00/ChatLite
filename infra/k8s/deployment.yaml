@@ -20,8 +20,8 @@ spec:
     spec:
       containers:
         - name: chatlite
-          image: chatlite:latest
-          imagePullPolicy: IfNotPresent
+          image: anitalluri00/chatlite:latest
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8501

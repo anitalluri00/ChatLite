@@ -3,13 +3,19 @@ from __future__ import annotations
 import base64
 import binascii
 from collections import Counter
+from difflib import SequenceMatcher
+from email.message import EmailMessage
 import hashlib
 import hmac
+import importlib
+import io
 import json
 import os
 import random
 import re
+import smtplib
 import sqlite3
+import ssl
 import uuid
 import zlib
 from datetime import datetime, timedelta
@@ -54,6 +60,21 @@ def env_int(name: str, default: int) -> int:
 APP_TITLE = "ChatLite"
 APP_SECRET = os.getenv("CHATLITE_APP_SECRET", "chatlite-local-development-secret")
 DATABASE_URL = os.getenv("CHATLITE_DATABASE_URL") or os.getenv("DATABASE_URL", "")
+SMTP_HOST = os.getenv("CHATLITE_SMTP_HOST", "")
+SMTP_PORT = max(1, env_int("CHATLITE_SMTP_PORT", 587))
+SMTP_USERNAME = os.getenv("CHATLITE_SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("CHATLITE_SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = os.getenv("CHATLITE_SMTP_FROM_EMAIL", SMTP_USERNAME or "no-reply@chatlite.local")
+PUSH_WEBHOOK_URL = os.getenv("CHATLITE_PUSH_WEBHOOK_URL", "")
+ONESIGNAL_APP_ID = os.getenv("CHATLITE_ONESIGNAL_APP_ID", "")
+ONESIGNAL_API_KEY = os.getenv("CHATLITE_ONESIGNAL_API_KEY", "")
+FIREBASE_CREDENTIALS_FILE = os.getenv("CHATLITE_FIREBASE_CREDENTIALS_FILE", "")
+FIREBASE_TOPIC = os.getenv("CHATLITE_FIREBASE_TOPIC", "chatlite")
+OBJECT_STORAGE_PROVIDER = os.getenv("CHATLITE_OBJECT_STORAGE_PROVIDER", "local").strip().lower()
+OBJECT_STORAGE_BUCKET = os.getenv("CHATLITE_OBJECT_STORAGE_BUCKET", "")
+OBJECT_STORAGE_ENDPOINT = os.getenv("CHATLITE_OBJECT_STORAGE_ENDPOINT", "")
+OBJECT_STORAGE_ACCESS_KEY = os.getenv("CHATLITE_OBJECT_STORAGE_ACCESS_KEY", "")
+OBJECT_STORAGE_SECRET_KEY = os.getenv("CHATLITE_OBJECT_STORAGE_SECRET_KEY", "")
 SQLITE_FILE = Path(os.getenv("CHATLITE_SQLITE_FILE", "chatlite_data.sqlite3")).expanduser()
 LEGACY_DATA_FILE = Path(os.getenv("CHATLITE_DATA_FILE", "chatlite_data.json")).expanduser()
 STORAGE_BACKEND = os.getenv("CHATLITE_STORAGE_BACKEND", "").strip().lower()
@@ -141,6 +162,21 @@ MEDIA_EXTENSIONS = [
     "mov",
     "webm",
 ]
+REACTION_OPTIONS = ["like", "love", "laugh", "wow", "sad", "thanks"]
+DISAPPEARING_OPTIONS = {
+    "Off": 0,
+    "1 hour": 60 * 60,
+    "24 hours": 24 * 60 * 60,
+    "7 days": 7 * 24 * 60 * 60,
+}
+CALL_TYPES = ["voice", "video"]
+TOPIC_KEYWORDS = {
+    "work": {"deadline", "meeting", "project", "ticket", "deploy", "review", "client"},
+    "family": {"family", "home", "mom", "dad", "birthday", "dinner"},
+    "urgent": {"urgent", "asap", "blocked", "critical", "issue", "help"},
+    "finance": {"invoice", "payment", "budget", "cost", "billing"},
+    "travel": {"flight", "hotel", "trip", "booking", "train"},
+}
 PHOTO_TYPES = {
     "image/jpeg": "jpg",
     "image/png": "png",
@@ -415,7 +451,7 @@ def build_seed_data() -> dict[str, Any]:
     }
     group_id = "project-crew"
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "users": users,
         "groups": {
             group_id: {
@@ -442,6 +478,12 @@ def build_seed_data() -> dict[str, Any]:
         "attachments": {},
         "rate_limits": {},
         "backups": [],
+        "calls": [],
+        "device_sessions": {},
+        "scheduled_messages": [],
+        "moderation_queue": [],
+        "push_notifications": [],
+        "offline_queue": {},
         "encryption": {"active_key_version": 1, "rotations": []},
         "messages": {
             private_chat_id("demo", "aisha"): [
@@ -497,7 +539,7 @@ def message_state_from_lists(message: dict[str, Any], members: list[str]) -> str
 
 def ensure_data_shape(data: dict[str, Any]) -> dict[str, Any]:
     previous_version = safe_int(data.get("schema_version"), 1)
-    data["schema_version"] = 4
+    data["schema_version"] = 5
     data.setdefault("users", {})
     data.setdefault("groups", {})
     data.setdefault("friend_requests", [])
@@ -507,6 +549,12 @@ def ensure_data_shape(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("attachments", {})
     data.setdefault("rate_limits", {})
     data.setdefault("backups", [])
+    data.setdefault("calls", [])
+    data.setdefault("device_sessions", {})
+    data.setdefault("scheduled_messages", [])
+    data.setdefault("moderation_queue", [])
+    data.setdefault("push_notifications", [])
+    data.setdefault("offline_queue", {})
     encryption = data.setdefault("encryption", {})
     encryption.setdefault("active_key_version", 1)
     encryption.setdefault("rotations", [])
@@ -535,6 +583,13 @@ def ensure_data_shape(data: dict[str, Any]) -> dict[str, Any]:
         user["reported_users"] = sorted(set(user.get("reported_users", [])))
         user["pinned_chats"] = sorted(set(user.get("pinned_chats", [])))
         user["archived_chats"] = sorted(set(user.get("archived_chats", [])))
+        user["starred_messages"] = sorted(set(user.get("starred_messages", [])))
+        user["saved_messages"] = sorted(set(user.get("saved_messages", [])))
+        user.setdefault("notification_keywords", [])
+        user.setdefault("trust_score", 80)
+        user.setdefault("abuse_score", 0)
+        user.setdefault("last_login_at", "")
+        user.setdefault("last_login_ip", "")
         user.setdefault("last_seen_at", "")
         user.setdefault("online_until", "")
         user.setdefault("password_reset", {})
@@ -560,6 +615,9 @@ def ensure_data_shape(data: dict[str, Any]) -> dict[str, Any]:
         group.setdefault("photo_data_uri", "")
         group.setdefault("accent", "#2f80ed")
         group.setdefault("created_at", current_stamp())
+        group.setdefault("invite_code", uuid.uuid4().hex[:10])
+        group.setdefault("approval_required", False)
+        group.setdefault("join_requests", [])
 
     for conversation_id, messages in data["messages"].items():
         members = conversation_members_from_data(data, conversation_id)
@@ -572,6 +630,15 @@ def ensure_data_shape(data: dict[str, Any]) -> dict[str, Any]:
             message.setdefault("edited_at", "")
             message.setdefault("deleted_at", "")
             message.setdefault("deleted", False)
+            message.setdefault("expires_at", "")
+            message.setdefault("reply_to", "")
+            message.setdefault("forwarded_from", "")
+            message.setdefault("starred_by", [])
+            message.setdefault("reactions", {})
+            message.setdefault("poll", None)
+            message.setdefault("conflict_version", 1)
+            message.setdefault("topic_labels", [])
+            message.setdefault("duplicate_cluster_id", "")
             message.setdefault("moderation_flags", [])
             message.setdefault("spam_score", 0)
             message.setdefault("compressed", False)
@@ -590,6 +657,39 @@ def ensure_data_shape(data: dict[str, Any]) -> dict[str, Any]:
             plaintext = message.pop("text", "")
             message.update(encrypted_message_payload(conversation_id, plaintext, active_encryption_version(data)))
             message["state"] = message_state_from_lists(message, members)
+
+    for attachment_hash, asset in data["attachments"].items():
+        asset.setdefault("hash", attachment_hash)
+        asset.setdefault("storage_backend", OBJECT_STORAGE_PROVIDER)
+        asset.setdefault("object_key", "")
+        asset.setdefault("scan_status", "clean")
+        asset.setdefault("thumbnail_data_uri", "")
+
+    for call in data["calls"]:
+        call.setdefault("id", str(uuid.uuid4()))
+        call.setdefault("conversation_id", "")
+        call.setdefault("caller", "")
+        call.setdefault("type", "voice")
+        call.setdefault("status", "completed")
+        call.setdefault("started_at", current_stamp())
+        call.setdefault("ended_at", "")
+        call.setdefault("participants", [])
+
+    for scheduled in data["scheduled_messages"]:
+        scheduled.setdefault("id", str(uuid.uuid4()))
+        scheduled.setdefault("sender", "")
+        scheduled.setdefault("conversation_id", "")
+        scheduled.setdefault("text", "")
+        scheduled.setdefault("send_at", current_stamp())
+        scheduled.setdefault("created_at", current_stamp())
+        scheduled.setdefault("status", "pending")
+        scheduled.setdefault("reply_to", "")
+        scheduled.setdefault("expires_at", "")
+
+    for username in data["users"]:
+        data["device_sessions"].setdefault(username, [])
+        data["offline_queue"].setdefault(username, [])
+
     return data
 
 
@@ -742,6 +842,15 @@ def rate_limit_identity(identity: str, action: str) -> str:
 
 def check_rate_limit(identity: str, action: str) -> tuple[bool, str]:
     limit, window_seconds = RATE_LIMIT_RULES.get(action, (20, 60))
+    if action in {"message", "friend_request"}:
+        username = (identity or "").split(":", 1)[0]
+        trust = user_trust_score(username)
+        if trust < 30:
+            limit = max(2, limit // 3)
+        elif trust < 60:
+            limit = max(3, limit // 2)
+        elif trust > 90:
+            limit = int(limit * 1.25)
     key = rate_limit_identity(identity or "anonymous", action)
     now = datetime.now()
     cutoff = now - timedelta(seconds=window_seconds)
@@ -772,6 +881,560 @@ def clear_rate_limit(identity: str, action: str) -> None:
     if key in buckets:
         buckets.pop(key, None)
         save_data(st.session_state.data)
+
+
+def message_ref(conversation_id: str, message_id: str) -> str:
+    return f"{conversation_id}::{message_id}"
+
+
+def fuzzy_ratio(first: str, second: str) -> float:
+    first = first.strip().lower()
+    second = second.strip().lower()
+    if not first or not second:
+        return 0.0
+    return SequenceMatcher(None, first, second).ratio()
+
+
+def user_trust_score(username: str) -> int:
+    user = get_user(username)
+    if not user:
+        return 50
+    trust = safe_int(user.get("trust_score"), 80)
+    abuse = safe_int(user.get("abuse_score"), 0)
+    return max(5, min(100, trust - abuse))
+
+
+def update_user_reputation(username: str, spam_score: int, flags: list[str]) -> None:
+    user = get_user(username)
+    if not user:
+        return
+    if spam_score >= 70 or flags:
+        user["abuse_score"] = min(100, safe_int(user.get("abuse_score"), 0) + 3 + len(flags))
+        user["trust_score"] = max(5, safe_int(user.get("trust_score"), 80) - 1)
+    else:
+        user["trust_score"] = min(100, safe_int(user.get("trust_score"), 80) + 1)
+
+
+def topic_labels_for_text(text: str) -> list[str]:
+    words = set(text_words(text))
+    labels = [label for label, keywords in TOPIC_KEYWORDS.items() if words & keywords]
+    return labels or ["general"]
+
+
+def toxicity_score(text: str) -> int:
+    words = set(text_words(text))
+    score = 0
+    score += min(60, len(words & DEFAULT_BLOCKED_WORDS) * 25)
+    if re.search(r"(.)\1{8,}", text):
+        score += 10
+    if any(term in text.lower() for term in ["threat", "attack", "harass"]):
+        score += 20
+    return min(100, score)
+
+
+def duplicate_cluster_id(conversation_id: str, sender: str, text: str) -> str:
+    normalized = " ".join(text_words(text))[:160]
+    if not normalized:
+        return ""
+    digest = hashlib.sha256(f"{conversation_id}:{sender}:{normalized}".encode("utf-8")).hexdigest()
+    return digest[:12]
+
+
+def find_message(conversation_id: str, message_id: str) -> dict[str, Any] | None:
+    return next(
+        (message for message in st.session_state.data["messages"].get(conversation_id, []) if message.get("id") == message_id),
+        None,
+    )
+
+
+def message_preview(conversation_id: str, message: dict[str, Any] | None, limit: int = 80) -> str:
+    if not message:
+        return "Message unavailable"
+    text = message_text(conversation_id, message)
+    if message.get("poll"):
+        text = f"Poll: {message['poll'].get('question', '')}"
+    if message.get("attachments") and not text:
+        text = f"{len(message.get('attachments', []))} attachment(s)"
+    return text[:limit] or "Message"
+
+
+def expiry_from_seconds(seconds: int) -> str:
+    if seconds <= 0:
+        return ""
+    return (datetime.now() + timedelta(seconds=seconds)).isoformat(timespec="seconds")
+
+
+def is_expired_message(message: dict[str, Any]) -> bool:
+    expires_at = parse_stamp(message.get("expires_at"))
+    return bool(expires_at and expires_at <= datetime.now() and not message.get("deleted"))
+
+
+def clean_expired_messages() -> None:
+    changed = False
+    for messages in st.session_state.data.get("messages", {}).values():
+        for message in messages:
+            if is_expired_message(message):
+                message["deleted"] = True
+                message["deleted_at"] = current_stamp()
+                message["state"] = "deleted"
+                message["attachments"] = []
+                message.pop("text", None)
+                message.pop("text_payload", None)
+                message.pop("ciphertext", None)
+                changed = True
+    if changed:
+        save_data(st.session_state.data)
+
+
+def flush_offline_queue(username: str) -> None:
+    queue = st.session_state.data.setdefault("offline_queue", {}).setdefault(username, [])
+    changed = False
+    for item in queue:
+        if item.get("status") == "queued":
+            item["status"] = "delivered"
+            item["delivered_at"] = current_stamp()
+            changed = True
+    if changed:
+        save_data(st.session_state.data)
+
+
+def scan_attachment_bytes(file_bytes: bytes, filename: str, mime_type: str) -> tuple[str, list[str]]:
+    lowered = filename.lower()
+    issues = []
+    if b"X5O!P%@AP" in file_bytes or b"EICAR-STANDARD-ANTIVIRUS-TEST-FILE" in file_bytes:
+        issues.append("EICAR test signature")
+    if lowered.endswith((".exe", ".bat", ".cmd", ".scr", ".js", ".vbs", ".ps1")):
+        issues.append("Executable attachment")
+    if mime_type == "application/octet-stream" and "." not in filename:
+        issues.append("Unknown binary file")
+    return ("blocked" if issues else "clean", issues)
+
+
+def thumbnail_for_attachment(file_bytes: bytes, mime_type: str) -> str:
+    if not mime_type.startswith("image/") or len(file_bytes) > 220_000:
+        return ""
+    encoded = base64.b64encode(file_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def send_push_notification(username: str, title: str, body: str, conversation_id: str = "") -> None:
+    status = "local"
+    if ONESIGNAL_APP_ID and ONESIGNAL_API_KEY:
+        try:
+            import requests
+
+            response = requests.post(
+                "https://onesignal.com/api/v1/notifications",
+                headers={"Authorization": f"Basic {ONESIGNAL_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "app_id": ONESIGNAL_APP_ID,
+                    "included_segments": ["Subscribed Users"],
+                    "headings": {"en": title},
+                    "contents": {"en": body},
+                    "data": {"username": username, "conversation_id": conversation_id},
+                },
+                timeout=5,
+            )
+            status = "sent" if response.ok else "failed"
+        except Exception:
+            status = "failed"
+    elif FIREBASE_CREDENTIALS_FILE:
+        try:
+            firebase_admin = importlib.import_module("firebase_admin")
+            credentials = importlib.import_module("firebase_admin.credentials")
+            messaging = importlib.import_module("firebase_admin.messaging")
+
+            if not getattr(firebase_admin, "_apps", None):
+                firebase_admin.initialize_app(credentials.Certificate(FIREBASE_CREDENTIALS_FILE))
+            messaging.send(
+                messaging.Message(
+                    notification=messaging.Notification(title=title, body=body),
+                    topic=FIREBASE_TOPIC,
+                    data={"username": username, "conversation_id": conversation_id},
+                )
+            )
+            status = "sent"
+        except Exception:
+            status = "failed"
+    elif PUSH_WEBHOOK_URL:
+        status = "queued"
+    st.session_state.data.setdefault("push_notifications", []).append(
+        {
+            "id": str(uuid.uuid4()),
+            "to": username,
+            "title": title,
+            "body": body,
+            "conversation_id": conversation_id,
+            "created_at": current_stamp(),
+            "status": status,
+        }
+    )
+
+
+def send_reset_email(email_value: str, code: str) -> bool:
+    if not (SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD):
+        return False
+    message = EmailMessage()
+    message["Subject"] = "ChatLite password reset code"
+    message["From"] = SMTP_FROM_EMAIL
+    message["To"] = email_value
+    message.set_content(f"Your ChatLite reset code is: {code}\n\nThis code expires in 15 minutes.")
+    context = ssl.create_default_context()
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+        smtp.starttls(context=context)
+        smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+    smtp.send_message(message)
+    return True
+
+
+def detect_login_anomaly(user: dict[str, Any]) -> list[str]:
+    flags = []
+    client_ip = os.getenv("CHATLITE_CLIENT_IP", "")
+    previous_ip = user.get("last_login_ip", "")
+    if client_ip and previous_ip and client_ip != previous_ip:
+        flags.append("login from new client IP")
+    hour = datetime.now().hour
+    if user.get("last_login_at") and hour < 5:
+        flags.append("unusual login hour")
+    return flags
+
+
+def create_device_session(username: str, label: str = "Web session") -> str:
+    session_id = uuid.uuid4().hex
+    sessions = st.session_state.data.setdefault("device_sessions", {}).setdefault(username, [])
+    sessions.append(
+        {
+            "id": session_id,
+            "label": label,
+            "created_at": current_stamp(),
+            "last_seen_at": current_stamp(),
+            "active": True,
+        }
+    )
+    return session_id
+
+
+def touch_device_session(username: str) -> None:
+    session_id = st.session_state.get("current_session_id", "")
+    for session in st.session_state.data.setdefault("device_sessions", {}).setdefault(username, []):
+        if session.get("id") == session_id:
+            session["last_seen_at"] = current_stamp()
+            session["active"] = True
+            return
+
+
+def logout_device(username: str, session_id: str) -> None:
+    for session in st.session_state.data.setdefault("device_sessions", {}).setdefault(username, []):
+        if session.get("id") == session_id:
+            session["active"] = False
+            session["ended_at"] = current_stamp()
+
+
+def logout_all_devices(username: str) -> None:
+    for session in st.session_state.data.setdefault("device_sessions", {}).setdefault(username, []):
+        session["active"] = False
+        session["ended_at"] = current_stamp()
+    save_data(st.session_state.data)
+
+
+def start_call(username: str, conversation_id: str, call_type: str) -> tuple[bool, str]:
+    if call_type not in CALL_TYPES:
+        return False, "Choose voice or video."
+    members = conversation_members(conversation_id)
+    if username not in members:
+        return False, "You are not a member of this chat."
+    st.session_state.data.setdefault("calls", []).insert(
+        0,
+        {
+            "id": str(uuid.uuid4()),
+            "conversation_id": conversation_id,
+            "caller": username,
+            "type": call_type,
+            "status": "completed",
+            "started_at": current_stamp(),
+            "ended_at": current_stamp(),
+            "participants": members,
+        },
+    )
+    save_data(st.session_state.data)
+    return True, f"{call_type.title()} call added to history."
+
+
+def toggle_reaction(conversation_id: str, message_id: str, username: str, reaction: str) -> tuple[bool, str]:
+    message = find_message(conversation_id, message_id)
+    if not message or message.get("deleted"):
+        return False, "Message not found."
+    reactions = message.setdefault("reactions", {})
+    users = set(reactions.get(reaction, []))
+    if username in users:
+        users.remove(username)
+    else:
+        users.add(username)
+    if users:
+        reactions[reaction] = sorted(users)
+    else:
+        reactions.pop(reaction, None)
+    save_data(st.session_state.data)
+    return True, "Reaction updated."
+
+
+def toggle_star_message(conversation_id: str, message_id: str, username: str) -> tuple[bool, str]:
+    message = find_message(conversation_id, message_id)
+    user = get_user(username)
+    if not message or not user:
+        return False, "Message not found."
+    ref = message_ref(conversation_id, message_id)
+    starred = set(message.setdefault("starred_by", []))
+    saved = set(user.get("starred_messages", []))
+    if username in starred:
+        starred.remove(username)
+        saved.discard(ref)
+        label = "Message unstarred."
+    else:
+        starred.add(username)
+        saved.add(ref)
+        label = "Message starred."
+    message["starred_by"] = sorted(starred)
+    user["starred_messages"] = sorted(saved)
+    user["saved_messages"] = sorted(saved)
+    save_data(st.session_state.data)
+    return True, label
+
+
+def forward_message(source_conversation_id: str, message_id: str, sender: str, target_conversation_id: str) -> tuple[bool, str]:
+    source = find_message(source_conversation_id, message_id)
+    if not source or source.get("deleted"):
+        return False, "Message not found."
+    text = message_text(source_conversation_id, source)
+    attachments = source.get("attachments", [])
+    success, message = add_message_to_conversation(
+        sender,
+        target_conversation_id,
+        text,
+        attachments=attachments,
+        forwarded_from=message_ref(source_conversation_id, message_id),
+    )
+    return success, "Message forwarded." if success else message
+
+
+def schedule_message(
+    sender: str,
+    conversation_id: str,
+    text: str,
+    send_at: datetime,
+    reply_to: str = "",
+    expires_at: str = "",
+) -> tuple[bool, str]:
+    if not text.strip():
+        return False, "Scheduled message needs text."
+    if send_at <= datetime.now():
+        return False, "Choose a future time."
+    st.session_state.data.setdefault("scheduled_messages", []).append(
+        {
+            "id": str(uuid.uuid4()),
+            "sender": sender,
+            "conversation_id": conversation_id,
+            "text": text.strip(),
+            "send_at": send_at.isoformat(timespec="seconds"),
+            "created_at": current_stamp(),
+            "status": "pending",
+            "reply_to": reply_to,
+            "expires_at": expires_at,
+        }
+    )
+    save_data(st.session_state.data)
+    return True, "Message scheduled."
+
+
+def deliver_due_scheduled_messages() -> None:
+    changed = False
+    for scheduled in st.session_state.data.setdefault("scheduled_messages", []):
+        if scheduled.get("status") != "pending":
+            continue
+        send_at = parse_stamp(scheduled.get("send_at"))
+        if not send_at or send_at > datetime.now():
+            continue
+        success, _ = add_message_to_conversation(
+            scheduled["sender"],
+            scheduled["conversation_id"],
+            scheduled["text"],
+            reply_to=scheduled.get("reply_to", ""),
+            expires_at=scheduled.get("expires_at", ""),
+            skip_rate_limit=True,
+        )
+        scheduled["status"] = "sent" if success else "failed"
+        scheduled["sent_at"] = current_stamp()
+        changed = True
+    if changed:
+        save_data(st.session_state.data)
+
+
+def create_poll_message(sender: str, conversation_id: str, question: str, options: list[str]) -> tuple[bool, str]:
+    if not is_group_conversation(conversation_id):
+        return False, "Polls are available in groups."
+    cleaned_question = question.strip()
+    cleaned_options = [option.strip() for option in options if option.strip()]
+    if not cleaned_question or len(cleaned_options) < 2:
+        return False, "Add a question and at least two options."
+    success, message = add_message_to_conversation(
+        sender,
+        conversation_id,
+        f"Poll: {cleaned_question}",
+        poll={
+            "question": cleaned_question,
+            "options": [{"id": uuid.uuid4().hex[:8], "text": option, "votes": []} for option in cleaned_options[:6]],
+            "closed": False,
+        },
+    )
+    return success, "Poll created." if success else message
+
+
+def vote_poll(conversation_id: str, message_id: str, option_id: str, username: str) -> tuple[bool, str]:
+    message = find_message(conversation_id, message_id)
+    poll = message.get("poll") if message else None
+    if not poll or poll.get("closed"):
+        return False, "Poll not available."
+    for option in poll.get("options", []):
+        option["votes"] = [vote for vote in option.get("votes", []) if vote != username]
+    for option in poll.get("options", []):
+        if option.get("id") == option_id:
+            option.setdefault("votes", []).append(username)
+            save_data(st.session_state.data)
+            return True, "Vote saved."
+    return False, "Poll option not found."
+
+
+def request_group_join(invite_code: str, username: str) -> tuple[bool, str]:
+    cleaned = invite_code.strip()
+    group = next((item for item in st.session_state.data["groups"].values() if item.get("invite_code") == cleaned), None)
+    if not group:
+        return False, "Invite code not found."
+    if username in group.get("members", []):
+        return False, "You are already in this group."
+    if group.get("approval_required"):
+        requests = group.setdefault("join_requests", [])
+        if any(request.get("username") == username and request.get("status") == "pending" for request in requests):
+            return False, "Join request already pending."
+        requests.append({"id": str(uuid.uuid4()), "username": username, "created_at": current_stamp(), "status": "pending"})
+        save_data(st.session_state.data)
+        return True, "Join request sent to group admins."
+    group["members"] = sorted(set(group.get("members", [])) | {username})
+    group.setdefault("roles", {})[username] = "member"
+    save_data(st.session_state.data)
+    return True, f"Joined {group.get('name', 'group')}."
+
+
+def respond_group_join(group_id: str, request_id: str, approve: bool) -> tuple[bool, str]:
+    group = get_group(group_id)
+    if not group:
+        return False, "Group not found."
+    request = next((item for item in group.get("join_requests", []) if item.get("id") == request_id), None)
+    if not request:
+        return False, "Join request not found."
+    request["status"] = "approved" if approve else "declined"
+    request["resolved_at"] = current_stamp()
+    username = request.get("username", "")
+    if approve and username in st.session_state.data["users"]:
+        group["members"] = sorted(set(group.get("members", [])) | {username})
+        group.setdefault("roles", {})[username] = "member"
+    save_data(st.session_state.data)
+    return True, "Join request updated."
+
+
+def import_contacts(current_user: str, raw_contacts: str) -> tuple[int, list[str]]:
+    sent = 0
+    messages = []
+    for token in re.split(r"[\s,;]+", raw_contacts):
+        token = token.strip()
+        if not token:
+            continue
+        target = username_for_friend_identifier(token)
+        if not target and PHONE_PATTERN.fullmatch(token):
+            target = next(
+                (
+                    username
+                    for username, user in st.session_state.data["users"].items()
+                    if token.replace(" ", "") in user.get("phone_number", "").replace(" ", "")
+                ),
+                None,
+            )
+        if not target:
+            messages.append(f"{token}: not found")
+            continue
+        success, message = send_friend_request(current_user, target)
+        if success:
+            sent += 1
+        messages.append(f"{token}: {message}")
+    return sent, messages
+
+
+def export_chat_text(current_user: str, conversation_id: str) -> str:
+    lines = [f"Chat export: {conversation_id}", f"Exported by @{current_user} at {current_stamp()}", ""]
+    for message in st.session_state.data["messages"].get(conversation_id, []):
+        if message.get("deleted"):
+            continue
+        sender = get_user(message.get("sender", ""))
+        sender_name = sender["display_name"] if sender else message.get("sender", "Unknown")
+        lines.append(f"[{message.get('created_at', '')}] {sender_name}: {message_preview(conversation_id, message, 500)}")
+    return "\n".join(lines)
+
+
+def export_chat_pdf_bytes(current_user: str, conversation_id: str) -> bytes:
+    text = export_chat_text(current_user, conversation_id)
+    safe_lines = [line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")[:110] for line in text.splitlines()]
+    stream_lines = ["BT", "/F1 10 Tf", "50 780 Td"]
+    for line in safe_lines[:70]:
+        stream_lines.append(f"({line}) Tj")
+        stream_lines.append("0 -14 Td")
+    stream_lines.append("ET")
+    stream = "\n".join(stream_lines).encode("latin-1", errors="replace")
+    objects = [
+        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj",
+        b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj",
+        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj",
+        b"4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj",
+        b"5 0 obj << /Length " + str(len(stream)).encode("ascii") + b" >> stream\n" + stream + b"\nendstream endobj",
+    ]
+    output = io.BytesIO()
+    output.write(b"%PDF-1.4\n")
+    offsets = [0]
+    for obj in objects:
+        offsets.append(output.tell())
+        output.write(obj + b"\n")
+    xref_at = output.tell()
+    output.write(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("ascii"))
+    for offset in offsets[1:]:
+        output.write(f"{offset:010d} 00000 n \n".encode("ascii"))
+    output.write(f"trailer << /Root 1 0 R /Size {len(objects) + 1} >>\nstartxref\n{xref_at}\n%%EOF".encode("ascii"))
+    return output.getvalue()
+
+
+def user_activity_stats(username: str) -> dict[str, int]:
+    sent = 0
+    starred = len(get_user(username).get("starred_messages", [])) if get_user(username) else 0
+    calls = sum(1 for call in st.session_state.data.get("calls", []) if username in call.get("participants", []))
+    scheduled = sum(1 for item in st.session_state.data.get("scheduled_messages", []) if item.get("sender") == username and item.get("status") == "pending")
+    for messages in st.session_state.data.get("messages", {}).values():
+        sent += sum(1 for message in messages if message.get("sender") == username)
+    return {"messages_sent": sent, "starred": starred, "calls": calls, "scheduled": scheduled}
+
+
+def smart_reply_suggestions(current_user: str, conversation_id: str) -> list[str]:
+    messages = [
+        message
+        for message in st.session_state.data["messages"].get(conversation_id, [])
+        if message.get("sender") != current_user and not message.get("deleted")
+    ]
+    if not messages:
+        return ["Hi", "Thanks", "Sure"]
+    latest = message_text(conversation_id, messages[-1]).lower()
+    if "?" in latest:
+        return ["Yes, sounds good.", "Let me check and reply.", "Can you share more details?"]
+    if any(word in latest for word in ["urgent", "asap", "blocked", "issue"]):
+        return ["I am checking this now.", "Please send the details.", "I will update you shortly."]
+    if any(word in latest for word in ["thanks", "thank you"]):
+        return ["You are welcome.", "Happy to help.", "Anytime."]
+    return ["Got it.", "Thanks for the update.", "I will check."]
 
 
 def text_words(value: str) -> list[str]:
@@ -832,9 +1495,47 @@ def compress_bytes(payload: bytes) -> tuple[bool, bytes]:
     return False, payload
 
 
+def upload_object_storage(object_key: str, payload: bytes, mime_type: str) -> tuple[str, str]:
+    if OBJECT_STORAGE_PROVIDER not in {"s3", "minio"} or not OBJECT_STORAGE_BUCKET:
+        return "", ""
+    try:
+        if OBJECT_STORAGE_PROVIDER == "s3":
+            boto3 = importlib.import_module("boto3")
+
+            client_kwargs = {}
+            if OBJECT_STORAGE_ENDPOINT:
+                client_kwargs["endpoint_url"] = OBJECT_STORAGE_ENDPOINT
+            s3 = boto3.client("s3", **client_kwargs)
+            s3.put_object(Bucket=OBJECT_STORAGE_BUCKET, Key=object_key, Body=payload, ContentType=mime_type)
+            return OBJECT_STORAGE_PROVIDER, object_key
+        minio_module = importlib.import_module("minio")
+        Minio = getattr(minio_module, "Minio")
+
+        endpoint = OBJECT_STORAGE_ENDPOINT.replace("https://", "").replace("http://", "")
+        minio_client = Minio(
+            endpoint,
+            access_key=OBJECT_STORAGE_ACCESS_KEY,
+            secret_key=OBJECT_STORAGE_SECRET_KEY,
+            secure=OBJECT_STORAGE_ENDPOINT.startswith("https://"),
+        )
+        if not minio_client.bucket_exists(OBJECT_STORAGE_BUCKET):
+            minio_client.make_bucket(OBJECT_STORAGE_BUCKET)
+        minio_client.put_object(
+            OBJECT_STORAGE_BUCKET,
+            object_key,
+            io.BytesIO(payload),
+            length=len(payload),
+            content_type=mime_type,
+        )
+        return OBJECT_STORAGE_PROVIDER, object_key
+    except Exception:
+        return "", ""
+
+
 def store_attachment_asset(file_bytes: bytes, mime_type: str) -> tuple[str, bool, int]:
     digest = hashlib.sha256(file_bytes).hexdigest()
     compressed, payload = compress_bytes(file_bytes)
+    object_backend, object_key = upload_object_storage(f"attachments/{digest}", payload, mime_type)
     assets = st.session_state.data.setdefault("attachments", {})
     if digest not in assets:
         assets[digest] = {
@@ -846,6 +1547,8 @@ def store_attachment_asset(file_bytes: bytes, mime_type: str) -> tuple[str, bool
             "payload": base64.b64encode(payload).decode("ascii"),
             "created_at": current_stamp(),
             "ref_count": 0,
+            "storage_backend": object_backend or "local",
+            "object_key": object_key,
         }
     assets[digest]["ref_count"] = safe_int(assets[digest].get("ref_count"), 0) + 1
     return digest, bool(assets[digest].get("compressed")), safe_int(assets[digest].get("stored_size"), len(file_bytes))
@@ -915,6 +1618,8 @@ def conversation_search_score(current_user: str, item: dict[str, Any], query: st
         score += 120
     elif needle in title:
         score += 70
+    elif fuzzy_ratio(needle, title) >= 0.72:
+        score += 45
     if needle in subtitle:
         score += 25
     latest = latest_message(current_user, item["conversation_id"]).lower()
@@ -922,6 +1627,8 @@ def conversation_search_score(current_user: str, item: dict[str, Any], query: st
         score += 90
     elif needle in latest:
         score += 45
+    elif fuzzy_ratio(needle, latest[:120]) >= 0.72:
+        score += 28
     query_words = text_words(needle)
     for message in st.session_state.data["messages"].get(item["conversation_id"], []):
         text = message_text(item["conversation_id"], message).lower()
@@ -935,14 +1642,20 @@ def conversation_search_score(current_user: str, item: dict[str, Any], query: st
         ).lower()
         if needle in sender_label:
             score += 35
+        elif fuzzy_ratio(needle, sender_label) >= 0.74:
+            score += 24
         if needle in text:
             score += 20 + min(40, text.count(needle) * 8)
+        elif fuzzy_ratio(needle, text[:160]) >= 0.72:
+            score += 16
         if query_words:
             message_words = Counter(text_words(text))
             score += min(30, sum(message_words.get(word, 0) for word in query_words) * 3)
         for attachment in message.get("attachments", []):
             if needle in attachment.get("name", "").lower():
                 score += 25
+            elif fuzzy_ratio(needle, attachment.get("name", "")) >= 0.75:
+                score += 14
     if score:
         score += min(25, count_unread(current_user, item["conversation_id"]) * 3)
     return score
@@ -976,8 +1689,12 @@ def message_search_score(conversation_id: str, message: dict[str, Any], query: s
         score += 120
     elif needle in text:
         score += 55 + min(50, text.count(needle) * 10)
+    elif fuzzy_ratio(needle, text[:160]) >= 0.72:
+        score += 35
     if needle in sender_label:
         score += 40
+    elif fuzzy_ratio(needle, sender_label) >= 0.74:
+        score += 24
     query_words = text_words(needle)
     if query_words:
         message_words = Counter(text_words(text))
@@ -985,6 +1702,8 @@ def message_search_score(conversation_id: str, message: dict[str, Any], query: s
     for attachment in message.get("attachments", []):
         if needle in attachment.get("name", "").lower():
             score += 25
+        elif fuzzy_ratio(needle, attachment.get("name", "")) >= 0.75:
+            score += 14
     return score
 
 
@@ -1058,14 +1777,25 @@ def important_unread_count(username: str) -> int:
         ]
         if not unread_messages:
             continue
-        if is_pinned(user, conversation_id) or len(unread_messages) >= 3:
-            important += len(unread_messages)
-            continue
         for message in unread_messages:
-            text = message_text(conversation_id, message).lower()
-            if f"@{username}".lower() in text or any(keyword in text for keyword in IMPORTANT_KEYWORDS):
+            if notification_priority_score(username, conversation_id, message) >= 50:
                 important += 1
     return important
+
+
+def notification_priority_score(username: str, conversation_id: str, message: dict[str, Any]) -> int:
+    user = get_user(username)
+    text = message_text(conversation_id, message).lower()
+    score = 10
+    if user and is_pinned(user, conversation_id):
+        score += 35
+    if f"@{username}".lower() in text:
+        score += 40
+    score += min(25, count_unread(username, conversation_id) * 5)
+    score += 20 if any(keyword in text for keyword in IMPORTANT_KEYWORDS) else 0
+    custom_keywords = [keyword.lower() for keyword in (user or {}).get("notification_keywords", [])]
+    score += 20 if any(keyword and keyword in text for keyword in custom_keywords) else 0
+    return min(100, score)
 
 
 def create_backup(label: str = "Manual backup") -> tuple[bool, str]:
@@ -1080,6 +1810,7 @@ def create_backup(label: str = "Manual backup") -> tuple[bool, str]:
         "schema_version": snapshot.get("schema_version", 4),
         "size": len(payload),
         "stored_size": len(compressed),
+        "checksum": hashlib.sha256(payload).hexdigest(),
         "payload": base64.b64encode(compressed).decode("ascii"),
     }
     backups = st.session_state.data.setdefault("backups", [])
@@ -1101,7 +1832,11 @@ def restore_backup(backup_id: str) -> tuple[bool, str]:
     if not backup:
         return False, "Backup not found."
     try:
-        payload = zlib.decompress(base64.b64decode(backup.get("payload", ""))).decode("utf-8")
+        payload_bytes = zlib.decompress(base64.b64decode(backup.get("payload", "")))
+        checksum = backup.get("checksum", "")
+        if checksum and hashlib.sha256(payload_bytes).hexdigest() != checksum:
+            return False, "Backup checksum verification failed."
+        payload = payload_bytes.decode("utf-8")
         restored = ensure_data_shape(json.loads(payload))
     except (binascii.Error, ValueError, zlib.error, UnicodeDecodeError, json.JSONDecodeError):
         return False, "Backup could not be restored."
@@ -1273,6 +2008,9 @@ def uploaded_file_to_attachment(uploaded_file: Any) -> tuple[bool, dict[str, Any
     if len(file_bytes) > MAX_ATTACHMENT_BYTES:
         return False, f"{uploaded_file.name} is too large. Limit is {MAX_ATTACHMENT_BYTES // 1_000_000} MB."
     mime_type = getattr(uploaded_file, "type", "") or "application/octet-stream"
+    scan_status, scan_issues = scan_attachment_bytes(file_bytes, uploaded_file.name, mime_type)
+    if scan_status == "blocked":
+        return False, f"{uploaded_file.name} blocked by media scan: {', '.join(scan_issues)}."
     asset_hash, compressed, stored_size = store_attachment_asset(file_bytes, mime_type)
     category = "file"
     if mime_type.startswith("image/"):
@@ -1289,6 +2027,11 @@ def uploaded_file_to_attachment(uploaded_file: Any) -> tuple[bool, dict[str, Any
         "stored_size": stored_size,
         "asset_hash": asset_hash,
         "compressed": compressed,
+        "scan_status": scan_status,
+        "scan_issues": scan_issues,
+        "thumbnail_data_uri": thumbnail_for_attachment(file_bytes, mime_type),
+        "storage_backend": OBJECT_STORAGE_PROVIDER,
+        "object_bucket": OBJECT_STORAGE_BUCKET,
         "category": category,
     }
 
@@ -1476,6 +2219,9 @@ def create_group(current_user: str, group_name: str, member_names: list[str], up
         "photo_data_uri": photo_data_uri,
         "accent": ACCENTS[len(st.session_state.data["groups"]) % len(ACCENTS)],
         "created_at": current_stamp(),
+        "invite_code": uuid.uuid4().hex[:10],
+        "approval_required": False,
+        "join_requests": [],
     }
     save_data(st.session_state.data)
     st.session_state.active_group = group_id
@@ -1612,10 +2358,15 @@ def add_message_to_conversation(
     conversation_id: str,
     text: str,
     attachments: list[dict[str, Any]] | None = None,
+    reply_to: str = "",
+    forwarded_from: str = "",
+    expires_at: str = "",
+    poll: dict[str, Any] | None = None,
+    skip_rate_limit: bool = False,
 ) -> tuple[bool, str]:
     cleaned = text.strip()
     attachments = attachments or []
-    if not cleaned and not attachments:
+    if not cleaned and not attachments and not poll:
         return False, "Type a message or attach a file."
     members = conversation_members(conversation_id)
     if not is_group_conversation(conversation_id):
@@ -1629,12 +2380,14 @@ def add_message_to_conversation(
     if sender not in members:
         return False, "You are not a member of this chat."
 
-    allowed, rate_message = check_rate_limit(f"{sender}:{conversation_id}", "message")
-    if not allowed:
-        return False, rate_message
+    if not skip_rate_limit:
+        allowed, rate_message = check_rate_limit(f"{sender}:{conversation_id}", "message")
+        if not allowed:
+            return False, rate_message
 
     content_issues = detect_content_issues(cleaned)
     spam_score = spam_detection_score(sender, conversation_id, cleaned, attachments)
+    toxic_score = toxicity_score(cleaned)
     blocking_issues = [issue["label"] for issue in content_issues if issue["severity"] == "block"]
     if spam_score >= 70:
         blocking_issues.append("Repeated message spam")
@@ -1644,24 +2397,65 @@ def add_message_to_conversation(
     moderation_flags = [issue["label"] for issue in content_issues]
     if spam_score >= 35:
         moderation_flags.append(f"Spam score {spam_score}")
+    if toxic_score >= 50:
+        moderation_flags.append(f"Toxicity score {toxic_score}")
+    update_user_reputation(sender, spam_score, moderation_flags)
     delivered_to = [member for member in members if member != sender]
+    message_id = str(uuid.uuid4())
     message = {
-        "id": str(uuid.uuid4()),
+        "id": message_id,
         "sender": sender,
         "time": current_time(),
         "created_at": current_stamp(),
         "edited_at": "",
         "deleted": False,
         "deleted_at": "",
+        "expires_at": expires_at,
+        "reply_to": reply_to,
+        "forwarded_from": forwarded_from,
         "attachments": attachments,
         "read_by": [sender],
         "delivered_to": delivered_to,
         "state": "delivered" if delivered_to else "sent",
         "moderation_flags": moderation_flags,
         "spam_score": spam_score,
+        "toxicity_score": toxic_score,
+        "topic_labels": topic_labels_for_text(cleaned),
+        "duplicate_cluster_id": duplicate_cluster_id(conversation_id, sender, cleaned),
+        "reactions": {},
+        "starred_by": [],
+        "poll": poll,
+        "conflict_version": 1,
         **encrypted_message_payload(conversation_id, cleaned),
     }
     st.session_state.data["messages"].setdefault(conversation_id, []).append(message)
+    if moderation_flags:
+        st.session_state.data.setdefault("moderation_queue", []).append(
+            {
+                "id": str(uuid.uuid4()),
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+                "sender": sender,
+                "flags": moderation_flags,
+                "created_at": current_stamp(),
+                "status": "open",
+            }
+        )
+    for member in delivered_to:
+        send_push_notification(member, "New ChatLite message", latest_message(member, conversation_id), conversation_id)
+        member_user = get_user(member)
+        online_until = parse_stamp(member_user.get("online_until")) if member_user else None
+        if not online_until or online_until <= datetime.now():
+            st.session_state.data.setdefault("offline_queue", {}).setdefault(member, []).append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "conversation_id": conversation_id,
+                    "message_id": message_id,
+                    "created_at": current_stamp(),
+                    "retry_count": 0,
+                    "status": "queued",
+                }
+            )
     clear_typing(sender, conversation_id)
     save_data(st.session_state.data)
     return True, "Message sent."
@@ -1683,6 +2477,8 @@ def edit_message(conversation_id: str, message_id: str, new_text: str, editor: s
             message.update(encrypted_message_payload(conversation_id, cleaned))
             message["edited_at"] = current_stamp()
             message["state"] = "edited"
+            message["conflict_version"] = safe_int(message.get("conflict_version"), 1) + 1
+            message["topic_labels"] = topic_labels_for_text(cleaned)
             message["moderation_flags"] = [issue["label"] for issue in content_issues]
             save_data(st.session_state.data)
             return True, "Message edited."
@@ -1696,6 +2492,7 @@ def delete_message(conversation_id: str, message_id: str, editor: str) -> tuple[
             message["deleted_at"] = current_stamp()
             message["attachments"] = []
             message["state"] = "deleted"
+            message["conflict_version"] = safe_int(message.get("conflict_version"), 1) + 1
             message.pop("text", None)
             message.pop("text_payload", None)
             message.pop("ciphertext", None)
@@ -1764,6 +2561,7 @@ def touch_presence(username: str) -> None:
     now = datetime.now()
     user["last_seen_at"] = now.isoformat(timespec="seconds")
     user["online_until"] = (now + timedelta(minutes=2)).isoformat(timespec="seconds")
+    touch_device_session(username)
     save_data(st.session_state.data)
 
 
@@ -1805,8 +2603,15 @@ def request_password_reset(email_value: str) -> tuple[bool, str]:
         "expires_at": (datetime.now() + timedelta(minutes=15)).isoformat(timespec="seconds"),
     }
     save_data(st.session_state.data)
+    try:
+        if send_reset_email(email, code):
+            st.session_state.reset_code_preview = ""
+            return True, "Reset code sent to your mail ID."
+    except (OSError, smtplib.SMTPException) as exc:
+        st.session_state.reset_code_preview = code
+        return True, f"SMTP failed, demo reset code generated instead: {exc}"
     st.session_state.reset_code_preview = code
-    return True, "Reset code generated. In production this should be sent by email."
+    return True, "Demo reset code generated. Configure SMTP to send real email."
 
 
 def complete_password_reset(email_value: str, code: str, new_password: str, confirm_password: str) -> tuple[bool, str]:
@@ -1863,8 +2668,10 @@ def create_account(
     st.session_state.data["users"][username] = make_user(username, display_name, password, email)
     save_data(st.session_state.data)
     st.session_state.current_user = username
+    st.session_state.current_session_id = create_device_session(username)
     st.session_state.active_friend = None
     st.session_state.active_group = None
+    touch_presence(username)
     return True, "Account created."
 
 
@@ -1879,9 +2686,15 @@ def login(email_value: str, password: str) -> tuple[bool, str]:
         return False, "Invalid mail ID or password."
 
     clear_rate_limit(email, "login")
+    anomaly_flags = detect_login_anomaly(user)
     st.session_state.current_user = username
+    st.session_state.current_session_id = create_device_session(username)
     st.session_state.active_friend = None
     st.session_state.active_group = None
+    user["last_login_at"] = current_stamp()
+    user["last_login_ip"] = os.getenv("CHATLITE_CLIENT_IP", user.get("last_login_ip", ""))
+    if anomaly_flags:
+        send_push_notification(username, "Security alert", ", ".join(anomaly_flags))
     touch_presence(username)
     return True, "Logged in."
 
@@ -1889,8 +2702,10 @@ def login(email_value: str, password: str) -> tuple[bool, str]:
 def logout() -> None:
     current_user = st.session_state.get("current_user")
     if current_user:
+        logout_device(current_user, st.session_state.get("current_session_id", ""))
         set_offline(current_user)
     st.session_state.current_user = None
+    st.session_state.current_session_id = None
     st.session_state.active_friend = None
     st.session_state.active_group = None
     st.query_params.clear()
@@ -2026,6 +2841,57 @@ def total_attachments_html(message: dict[str, Any]) -> str:
                 f'<a class="attachment-file" href="{data_uri}" download="{name}" type="{mime_type}">{name}</a>'
             )
     return "".join(parts)
+
+
+def reactions_html(message: dict[str, Any]) -> str:
+    reactions = message.get("reactions", {})
+    if not reactions:
+        return ""
+    parts = [
+        f'<span class="reaction-chip">{escape(reaction)} {len(users)}</span>'
+        for reaction, users in reactions.items()
+        if users
+    ]
+    return f'<div class="reaction-row">{"".join(parts)}</div>' if parts else ""
+
+
+def poll_html(message: dict[str, Any]) -> str:
+    poll = message.get("poll")
+    if not poll:
+        return ""
+    total_votes = sum(len(option.get("votes", [])) for option in poll.get("options", [])) or 1
+    options_html = []
+    for option in poll.get("options", []):
+        votes = len(option.get("votes", []))
+        percent = round(votes * 100 / total_votes)
+        options_html.append(
+            '<div class="poll-option">'
+            f'<div>{escape(option.get("text", ""))}</div>'
+            f'<div class="poll-bar"><span style="width:{percent}%"></span></div>'
+            f'<small>{votes} vote(s)</small>'
+            '</div>'
+        )
+    return f'<div class="poll-card"><b>{escape(poll.get("question", "Poll"))}</b>{"".join(options_html)}</div>'
+
+
+def reply_html(conversation_id: str, message: dict[str, Any]) -> str:
+    reply_to = message.get("reply_to")
+    if not reply_to:
+        return ""
+    original = find_message(conversation_id, reply_to)
+    return f'<div class="reply-preview">{escape(message_preview(conversation_id, original, 96))}</div>'
+
+
+def message_labels_html(message: dict[str, Any]) -> str:
+    labels = []
+    if message.get("forwarded_from"):
+        labels.append("forwarded")
+    if message.get("expires_at"):
+        labels.append("disappearing")
+    labels.extend(label for label in message.get("topic_labels", []) if label != "general")
+    if not labels:
+        return ""
+    return f'<div class="topic-labels">{"".join(f"<span>{escape(label)}</span>" for label in labels[:4])}</div>'
 
 
 def theme_override_css() -> str:
@@ -2569,6 +3435,54 @@ def inject_styles() -> None:
             font-weight: 800;
         }
 
+        .reply-preview,
+        .poll-card {
+            margin-bottom: 7px;
+            padding: 7px 8px;
+            border-left: 3px solid var(--wa-green);
+            border-radius: 8px;
+            background: rgba(4, 152, 109, 0.08);
+            color: #50606f;
+            font-size: 12px;
+            font-weight: 800;
+        }
+
+        .reaction-row,
+        .topic-labels {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            margin-top: 6px;
+        }
+
+        .reaction-chip,
+        .topic-labels span {
+            border-radius: 999px;
+            padding: 3px 7px;
+            background: rgba(80, 96, 111, 0.1);
+            color: #50606f;
+            font-size: 11px;
+            font-weight: 800;
+        }
+
+        .poll-option {
+            margin-top: 8px;
+        }
+
+        .poll-bar {
+            height: 6px;
+            border-radius: 999px;
+            background: rgba(80, 96, 111, 0.16);
+            overflow: hidden;
+            margin: 4px 0;
+        }
+
+        .poll-bar span {
+            display: block;
+            height: 100%;
+            background: var(--wa-green);
+        }
+
         .attachment-image,
         .attachment-video {
             display: block;
@@ -2985,6 +3899,13 @@ def render_security_backup_tools(current_user: str) -> None:
             f"{selected_backend().upper()} storage | {len(assets)} unique attachment(s) | "
             f"{saved_bytes // 1024} KB saved"
         )
+        rotations = st.session_state.data.get("encryption", {}).get("rotations", [])
+        if rotations:
+            latest_rotation = rotations[-1]
+            st.caption(
+                f"Key audit: v{latest_rotation.get('from')} -> v{latest_rotation.get('to')} | "
+                f"{latest_rotation.get('messages', 0)} message(s) | {latest_rotation.get('created_at', '')}"
+            )
         if st.button("Rotate encryption keys", key=f"rotate_keys_{current_user}", use_container_width=True):
             success, message = rotate_encryption_keys()
             if success:
@@ -3075,6 +3996,90 @@ def render_recommendations(current_user: str) -> None:
         )
 
 
+def render_contact_and_invite_tools(current_user: str) -> None:
+    with st.expander("Contacts & invites", expanded=False):
+        raw_contacts = st.text_area(
+            "Import contacts",
+            placeholder="Paste mail IDs, usernames, or phone numbers",
+            key=f"contact_import_{current_user}",
+        )
+        if st.button("Import contacts", key=f"import_contacts_{current_user}", use_container_width=True):
+            sent, messages = import_contacts(current_user, raw_contacts)
+            st.success(f"{sent} request(s) sent.")
+            if messages:
+                st.caption(" | ".join(messages[:6]))
+
+        invite_code = st.text_input("Group invite code", key=f"join_invite_{current_user}")
+        if st.button("Join group", key=f"join_group_invite_{current_user}", use_container_width=True):
+            success, message = request_group_join(invite_code, current_user)
+            if success:
+                st.success(message)
+                st.rerun()
+            else:
+                st.warning(message)
+
+
+def render_user_activity_dashboard(current_user: str) -> None:
+    with st.expander("Activity", expanded=False):
+        stats = user_activity_stats(current_user)
+        st.markdown(
+            f"""
+            <div class="profile-grid">
+                <span>Messages</span><span>{stats['messages_sent']}</span>
+                <span>Starred</span><span>{stats['starred']}</span>
+                <span>Calls</span><span>{stats['calls']}</span>
+                <span>Scheduled</span><span>{stats['scheduled']}</span>
+                <span>Trust</span><span>{user_trust_score(current_user)}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        user = get_user(current_user)
+        starred = user.get("starred_messages", []) if user else []
+        if starred:
+            st.caption("Starred messages")
+            for ref in starred[-5:]:
+                conversation_id, message_id = ref.rsplit("::", 1)
+                st.caption(message_preview(conversation_id, find_message(conversation_id, message_id), 90))
+
+
+def render_device_manager(current_user: str) -> None:
+    with st.expander("Devices", expanded=False):
+        sessions = st.session_state.data.setdefault("device_sessions", {}).setdefault(current_user, [])
+        active_sessions = [session for session in sessions if session.get("active")]
+        st.caption(f"{len(active_sessions)} active session(s)")
+        for session in active_sessions[-5:]:
+            st.caption(f"{session.get('label', 'Session')} | {session.get('last_seen_at', '')}")
+        if st.button("Logout from all devices", key=f"logout_all_{current_user}", use_container_width=True):
+            logout_all_devices(current_user)
+            logout()
+            st.rerun()
+
+
+def render_admin_moderation(current_user: str) -> None:
+    if current_user != "demo":
+        return
+    with st.expander("Admin moderation", expanded=False):
+        open_items = [
+            item
+            for item in st.session_state.data.get("moderation_queue", [])
+            if item.get("status") == "open"
+        ]
+        reports = st.session_state.data.get("reports", [])
+        st.caption(f"{len(open_items)} flagged message(s), {len(reports)} report(s)")
+        for item in open_items[-8:]:
+            message = find_message(item.get("conversation_id", ""), item.get("message_id", ""))
+            st.warning(
+                f"@{item.get('sender')} | {', '.join(item.get('flags', []))} | "
+                f"{message_preview(item.get('conversation_id', ''), message, 100)}"
+            )
+            if st.button("Resolve", key=f"resolve_mod_{item['id']}", use_container_width=True):
+                item["status"] = "resolved"
+                item["resolved_at"] = current_stamp()
+                save_data(st.session_state.data)
+                st.rerun()
+
+
 def render_sidebar(current_user: str) -> None:
     user = get_user(current_user)
     if not user:
@@ -3100,6 +4105,9 @@ def render_sidebar(current_user: str) -> None:
 
         render_profile_editor(current_user)
         render_security_backup_tools(current_user)
+        render_device_manager(current_user)
+        render_user_activity_dashboard(current_user)
+        render_admin_moderation(current_user)
         if st.button("Log out", key="logout", use_container_width=True):
             logout()
             st.rerun()
@@ -3145,6 +4153,7 @@ def render_sidebar(current_user: str) -> None:
             else:
                 st.warning(message)
 
+        render_contact_and_invite_tools(current_user)
         render_group_creator(current_user)
         render_recommendations(current_user)
 
@@ -3211,6 +4220,42 @@ def render_chat_tools(current_user: str, conversation_id: str, friend_username: 
                 st.session_state[summary_key] = summarize_conversation(current_user, conversation_id, unread_only)
         if st.session_state.get(summary_key):
             st.info(st.session_state[summary_key])
+
+        call_col, export_col = st.columns(2)
+        with call_col:
+            call_type = st.selectbox("Call type", CALL_TYPES, key=f"call_type_{safe_key(conversation_id)}")
+            if st.button("Add call history", key=f"call_{safe_key(conversation_id)}", use_container_width=True):
+                success, message = start_call(current_user, conversation_id, call_type)
+                if success:
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.warning(message)
+            recent_calls = [
+                call
+                for call in st.session_state.data.get("calls", [])
+                if call.get("conversation_id") == conversation_id
+            ][:3]
+            for call in recent_calls:
+                st.caption(f"{call.get('type', 'voice')} call | {call.get('started_at', '')} | {call.get('status', '')}")
+        with export_col:
+            st.download_button(
+                "Export text",
+                data=export_chat_text(current_user, conversation_id),
+                file_name=f"chatlite-{safe_key(conversation_id)}.txt",
+                mime="text/plain",
+                key=f"export_txt_{safe_key(conversation_id)}",
+                use_container_width=True,
+            )
+            st.download_button(
+                "Export PDF",
+                data=export_chat_pdf_bytes(current_user, conversation_id),
+                file_name=f"chatlite-{safe_key(conversation_id)}.pdf",
+                mime="application/pdf",
+                key=f"export_pdf_{safe_key(conversation_id)}",
+                use_container_width=True,
+            )
+
         pin_col, archive_col = st.columns(2)
         with pin_col:
             pin_label = "Unpin chat" if user and is_pinned(user, conversation_id) else "Pin chat"
@@ -3253,11 +4298,58 @@ def render_chat_tools(current_user: str, conversation_id: str, friend_username: 
         if group_id:
             group = get_group(group_id)
             if group:
+                with st.expander("Group poll", expanded=False):
+                    poll_question = st.text_input("Poll question", key=f"poll_question_{group_id}")
+                    poll_options = st.text_area(
+                        "Poll options",
+                        placeholder="One option per line",
+                        key=f"poll_options_{group_id}",
+                    )
+                    if st.button("Create poll", key=f"create_poll_{group_id}", use_container_width=True):
+                        success, message = create_poll_message(
+                            current_user,
+                            conversation_id,
+                            poll_question,
+                            poll_options.splitlines(),
+                        )
+                        if success:
+                            st.success(message)
+                            st.rerun()
+                        else:
+                            st.warning(message)
+
                 role_line = ", ".join(f"@{member} ({group_role(group, member)})" for member in group["members"])
                 st.caption(f"Owner: @{group['admin']} | Members: {role_line}")
+                st.text_input("Group invite code", value=group.get("invite_code", ""), disabled=True, key=f"invite_code_{group_id}")
                 if group_role(group, current_user) == "muted":
                     st.warning("You are muted in this group.")
                 if can_manage_group(group, current_user):
+                    approval_required = st.checkbox(
+                        "Require admin approval for invite joins",
+                        value=bool(group.get("approval_required")),
+                        key=f"group_approval_{group_id}",
+                    )
+                    if approval_required != bool(group.get("approval_required")):
+                        group["approval_required"] = approval_required
+                        save_data(st.session_state.data)
+                        st.rerun()
+                    pending_requests = [
+                        request
+                        for request in group.get("join_requests", [])
+                        if request.get("status") == "pending"
+                    ]
+                    for request in pending_requests:
+                        requester = get_user(request.get("username", ""))
+                        st.caption(f"Join request: @{request.get('username')} {requester.get('display_name', '') if requester else ''}")
+                        approve_col, decline_col = st.columns(2)
+                        with approve_col:
+                            if st.button("Approve", key=f"approve_join_{request['id']}", use_container_width=True):
+                                respond_group_join(group_id, request["id"], True)
+                                st.rerun()
+                        with decline_col:
+                            if st.button("Decline", key=f"decline_join_{request['id']}", use_container_width=True):
+                                respond_group_join(group_id, request["id"], False)
+                                st.rerun()
                     friends = [friend["username"] for friend in sorted_friend_users(current_user)]
                     add_options = [friend for friend in friends if friend not in group["members"]]
                     remove_options = [
@@ -3325,8 +4417,12 @@ def render_messages(current_user: str, conversation_id: str, search_term: str = 
             f'<div class="message-row {sender_class}">'
             f'<div class="message-bubble{deleted_class}">'
             f"{sender_html}"
+            f"{reply_html(conversation_id, message)}"
+            f"{message_labels_html(message)}"
             f"<div>{escape(text)}</div>"
+            f"{poll_html(message)}"
             f"{total_attachments_html(message)}"
+            f"{reactions_html(message)}"
             f"{flag_html}"
             '<div class="message-meta">'
             f"{edited}<span>{escape(message.get('time', ''))}</span>"
@@ -3352,6 +4448,18 @@ def render_composer(current_user: str, conversation_id: str, disabled: bool = Fa
         st.session_state[upload_nonce_key] += 1
 
     with st.container(key=f"composer-{key}"):
+        suggestions = smart_reply_suggestions(current_user, conversation_id)
+        suggestion_cols = st.columns(len(suggestions))
+        for index, suggestion in enumerate(suggestions):
+            with suggestion_cols[index]:
+                if st.button(
+                    suggestion,
+                    key=f"suggest_{key}_{index}",
+                    use_container_width=True,
+                    disabled=disabled,
+                ):
+                    st.session_state[input_key] = suggestion
+                    st.rerun()
         message_col, send_col = st.columns([1, 0.16], gap="small", vertical_alignment="bottom")
         with message_col:
             draft = st.text_input(
@@ -3378,6 +4486,34 @@ def render_composer(current_user: str, conversation_id: str, disabled: bool = Fa
             key=f"media_{key}_{st.session_state[upload_nonce_key]}",
             disabled=disabled,
         )
+        recent_messages = [
+            message
+            for message in st.session_state.data["messages"].get(conversation_id, [])[-10:]
+            if not message.get("deleted")
+        ]
+        reply_options = [""] + [message["id"] for message in recent_messages]
+        reply_to = st.selectbox(
+            "Reply to",
+            reply_options,
+            format_func=lambda message_id: "No reply"
+            if not message_id
+            else message_option_label(conversation_id, find_message(conversation_id, message_id) or {}),
+            key=f"reply_to_{key}",
+            disabled=disabled,
+        )
+        composer_cols = st.columns(3)
+        with composer_cols[0]:
+            disappear_label = st.selectbox(
+                "Disappearing",
+                list(DISAPPEARING_OPTIONS),
+                key=f"disappear_{key}",
+                disabled=disabled,
+            )
+        with composer_cols[1]:
+            schedule_enabled = st.checkbox("Schedule", key=f"schedule_enabled_{key}", disabled=disabled)
+        with composer_cols[2]:
+            schedule_date = st.date_input("Send date", key=f"schedule_date_{key}", disabled=disabled or not schedule_enabled)
+        schedule_time = st.time_input("Send time", key=f"schedule_time_{key}", disabled=disabled or not schedule_enabled)
 
     if disabled:
         typing = st.session_state.data.setdefault("typing", {}).setdefault(conversation_id, {})
@@ -3394,7 +4530,19 @@ def render_composer(current_user: str, conversation_id: str, disabled: bool = Fa
                 st.warning(str(result))
                 return
             attachments.append(result)
-        success, message = add_message_to_conversation(current_user, conversation_id, draft, attachments)
+        expires_at = expiry_from_seconds(DISAPPEARING_OPTIONS.get(disappear_label, 0))
+        if schedule_enabled:
+            send_at = datetime.combine(schedule_date, schedule_time)
+            success, message = schedule_message(current_user, conversation_id, draft, send_at, reply_to, expires_at)
+        else:
+            success, message = add_message_to_conversation(
+                current_user,
+                conversation_id,
+                draft,
+                attachments,
+                reply_to=reply_to,
+                expires_at=expires_at,
+            )
         if success:
             st.session_state[clear_key] = True
             st.rerun()
@@ -3403,6 +4551,72 @@ def render_composer(current_user: str, conversation_id: str, disabled: bool = Fa
 
 
 def render_message_tools(current_user: str, conversation_id: str) -> None:
+    all_messages = [
+        message
+        for message in st.session_state.data["messages"].get(conversation_id, [])
+        if not message.get("deleted")
+    ]
+    if all_messages:
+        with st.expander("Message actions", expanded=False):
+            message_by_id = {message["id"]: message for message in all_messages[-30:]}
+            selected_action_id = st.selectbox(
+                "Select message",
+                list(message_by_id),
+                format_func=lambda message_id: message_option_label(conversation_id, message_by_id[message_id]),
+                key=f"message_action_select_{safe_key(conversation_id)}",
+            )
+            selected_action = message_by_id[selected_action_id]
+            action_cols = st.columns(3)
+            with action_cols[0]:
+                reaction = st.selectbox(
+                    "Reaction",
+                    REACTION_OPTIONS,
+                    key=f"reaction_select_{safe_key(conversation_id)}",
+                )
+                if st.button("React", key=f"react_{selected_action_id}", use_container_width=True):
+                    success, message = toggle_reaction(conversation_id, selected_action_id, current_user, reaction)
+                    if success:
+                        st.rerun()
+                    st.warning(message)
+            with action_cols[1]:
+                star_label = "Unstar" if current_user in selected_action.get("starred_by", []) else "Star"
+                if st.button(star_label, key=f"star_{selected_action_id}", use_container_width=True):
+                    success, message = toggle_star_message(conversation_id, selected_action_id, current_user)
+                    if success:
+                        st.rerun()
+                    st.warning(message)
+            with action_cols[2]:
+                forward_items = chat_items(current_user, show_archived=True)
+                forward_ids = [item["conversation_id"] for item in forward_items if item["conversation_id"] != conversation_id]
+                if forward_ids:
+                    forward_to = st.selectbox(
+                        "Forward to",
+                        forward_ids,
+                        format_func=lambda item_id: next(item["title"] for item in forward_items if item["conversation_id"] == item_id),
+                        key=f"forward_to_{safe_key(conversation_id)}",
+                    )
+                    if st.button("Forward", key=f"forward_{selected_action_id}", use_container_width=True):
+                        success, message = forward_message(conversation_id, selected_action_id, current_user, forward_to)
+                        if success:
+                            st.success(message)
+                        else:
+                            st.warning(message)
+
+            if selected_action.get("poll"):
+                poll_options = selected_action["poll"].get("options", [])
+                option_ids = [option["id"] for option in poll_options]
+                vote_for = st.selectbox(
+                    "Poll vote",
+                    option_ids,
+                    format_func=lambda option_id: next(option["text"] for option in poll_options if option["id"] == option_id),
+                    key=f"poll_vote_{selected_action_id}",
+                )
+                if st.button("Vote", key=f"vote_{selected_action_id}", use_container_width=True):
+                    success, message = vote_poll(conversation_id, selected_action_id, vote_for, current_user)
+                    if success:
+                        st.rerun()
+                    st.warning(message)
+
     own_messages = [
         message
         for message in st.session_state.data["messages"].get(conversation_id, [])
@@ -3479,16 +4693,21 @@ def initialize_state() -> None:
         st.session_state.active_friend = None
     if "active_group" not in st.session_state:
         st.session_state.active_group = None
+    if "current_session_id" not in st.session_state:
+        st.session_state.current_session_id = None
     if "last_unread_total" not in st.session_state:
         st.session_state.last_unread_total = 0
     if "last_important_unread" not in st.session_state:
         st.session_state.last_important_unread = 0
 
     current_user = st.session_state.current_user
+    clean_expired_messages()
+    deliver_due_scheduled_messages()
     if not current_user:
         return
 
     touch_presence(current_user)
+    flush_offline_queue(current_user)
     friends = {friend["username"] for friend in sorted_friend_users(current_user)}
     groups = {
         group_id

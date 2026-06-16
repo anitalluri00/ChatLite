@@ -82,24 +82,6 @@ variable "node_disk_size" {
   default     = 50
 }
 
-variable "create_ecr_repository" {
-  description = "Create an ECR repository for the ChatLite image."
-  type        = bool
-  default     = true
-}
-
-variable "ecr_repository_name" {
-  description = "ECR repository name for the ChatLite image."
-  type        = string
-  default     = "chatlite"
-}
-
-variable "force_delete_ecr_repository" {
-  description = "Allow Terraform destroy to delete the ECR repository even when images exist."
-  type        = bool
-  default     = false
-}
-
 variable "extra_tags" {
   description = "Extra tags applied to AWS resources."
   type        = map(string)

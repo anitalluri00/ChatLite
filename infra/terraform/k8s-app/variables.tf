@@ -19,13 +19,13 @@ variable "app_name" {
 variable "image" {
   description = "Container image to deploy. Use a registry image for remote clusters."
   type        = string
-  default     = "chatlite:latest"
+  default     = "anitalluri00/chatlite:latest"
 }
 
 variable "image_pull_policy" {
   description = "Image pull policy for the ChatLite container."
   type        = string
-  default     = "IfNotPresent"
+  default     = "Always"
 }
 
 variable "replicas" {

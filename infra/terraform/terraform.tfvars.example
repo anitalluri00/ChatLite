@@ -26,7 +26,3 @@ node_min_size       = 2
 node_max_size       = 6
 node_desired_size   = 3
 node_disk_size      = 50
-
-create_ecr_repository       = true
-ecr_repository_name         = "chatlite"
-force_delete_ecr_repository = false
