@@ -50,6 +50,7 @@ resource "kubernetes_config_map_v1" "chatlite" {
     PORT                      = "8501"
     STREAMLIT_SERVER_ADDRESS  = "0.0.0.0"
     STREAMLIT_SERVER_HEADLESS = "true"
+    CHATLITE_REALTIME_WS_URL  = var.realtime_ws_url
     CHATLITE_SQLITE_FILE      = "/app/data/chatlite_data.sqlite3"
   }
 }

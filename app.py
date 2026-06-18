@@ -8,6 +8,7 @@ from email.message import EmailMessage
 import hashlib
 import hmac
 import importlib
+import inspect
 import io
 import json
 import os
@@ -22,9 +23,19 @@ from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import streamlit as st
+
+try:
+    import streamlit.components.v1 as components
+except ImportError:
+    components = None
+
+try:
+    FILE_UPLOADER_SUPPORTS_MAX_UPLOAD_SIZE = "max_upload_size" in inspect.signature(st.file_uploader).parameters
+except (TypeError, ValueError):
+    FILE_UPLOADER_SUPPORTS_MAX_UPLOAD_SIZE = False
 
 try:
     import phonenumbers
@@ -38,9 +49,16 @@ except ImportError:
 
 try:
     from cryptography.fernet import Fernet, InvalidToken
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding
+    from cryptography.hazmat.primitives.asymmetric import rsa
 except ImportError:
     Fernet = None
     InvalidToken = Exception
+    hashes = None
+    serialization = None
+    asymmetric_padding = None
+    rsa = None
 
 try:
     import psycopg
@@ -70,6 +88,7 @@ ONESIGNAL_APP_ID = os.getenv("CHATLITE_ONESIGNAL_APP_ID", "")
 ONESIGNAL_API_KEY = os.getenv("CHATLITE_ONESIGNAL_API_KEY", "")
 FIREBASE_CREDENTIALS_FILE = os.getenv("CHATLITE_FIREBASE_CREDENTIALS_FILE", "")
 FIREBASE_TOPIC = os.getenv("CHATLITE_FIREBASE_TOPIC", "chatlite")
+REALTIME_WS_URL = os.getenv("CHATLITE_REALTIME_WS_URL", "").rstrip("/")
 OBJECT_STORAGE_PROVIDER = os.getenv("CHATLITE_OBJECT_STORAGE_PROVIDER", "local").strip().lower()
 OBJECT_STORAGE_BUCKET = os.getenv("CHATLITE_OBJECT_STORAGE_BUCKET", "")
 OBJECT_STORAGE_ENDPOINT = os.getenv("CHATLITE_OBJECT_STORAGE_ENDPOINT", "")
@@ -250,6 +269,27 @@ def upload_limit_mb() -> int:
     return max(1, (MAX_ATTACHMENT_BYTES + 999_999) // 1_000_000)
 
 
+def file_uploader_compat(
+    label: str,
+    *,
+    file_types: list[str],
+    accept_multiple_files: bool,
+    key: str,
+    max_upload_size: int | None = None,
+    disabled: bool = False,
+) -> Any:
+    kwargs: dict[str, Any] = {
+        "label": label,
+        "type": file_types,
+        "accept_multiple_files": accept_multiple_files,
+        "key": key,
+        "disabled": disabled,
+    }
+    if max_upload_size is not None and FILE_UPLOADER_SUPPORTS_MAX_UPLOAD_SIZE:
+        kwargs["max_upload_size"] = max_upload_size
+    return st.file_uploader(**kwargs)
+
+
 def active_encryption_version(data: dict[str, Any] | None = None) -> int:
     if data is None:
         data = getattr(st.session_state, "data", {})
@@ -296,7 +336,250 @@ def default_email_for_username(username: str) -> str:
     return SEED_EMAILS.get(username, f"{username}@chatlite.local")
 
 
-def chat_cipher(conversation_id: str, key_version: int | None = None) -> Any | None:
+def crypto_available() -> bool:
+    return bool(Fernet and rsa and serialization and hashes and asymmetric_padding)
+
+
+def password_encryption_key(username: str, password: str, salt_hex: str) -> bytes:
+    try:
+        salt = bytes.fromhex(salt_hex)
+    except ValueError:
+        salt = salt_hex.encode("utf-8")
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        b"chatlite-user-key:" + username.encode("utf-8") + b":" + salt,
+        240_000,
+    )
+    return base64.urlsafe_b64encode(digest)
+
+
+def generate_user_encryption_identity(username: str, password: str, salt_hex: str) -> dict[str, str]:
+    if not crypto_available():
+        return {"public_key": "", "encrypted_private_key": ""}
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    locker = Fernet(password_encryption_key(username, password, salt_hex))
+    return {
+        "public_key": public_pem.decode("ascii"),
+        "encrypted_private_key": locker.encrypt(private_pem).decode("ascii"),
+    }
+
+
+def ensure_user_encryption_identity(username: str, password: str) -> bool:
+    user = get_user(username)
+    if not user or not crypto_available():
+        return False
+    user.setdefault("encryption_salt", uuid.uuid4().hex)
+    if user.get("public_key") and user.get("encrypted_private_key"):
+        return True
+    user.update(generate_user_encryption_identity(username, password, user["encryption_salt"]))
+    save_data(st.session_state.data)
+    return bool(user.get("public_key") and user.get("encrypted_private_key"))
+
+
+def reset_user_encryption_identity(username: str, password: str) -> None:
+    user = get_user(username)
+    if not user or not crypto_available():
+        return
+    user["encryption_salt"] = uuid.uuid4().hex
+    user.update(generate_user_encryption_identity(username, password, user["encryption_salt"]))
+
+
+def unlock_user_private_key(username: str, password: str) -> bool:
+    if not ensure_user_encryption_identity(username, password):
+        return False
+    user = get_user(username)
+    if not user:
+        return False
+    try:
+        locker = Fernet(password_encryption_key(username, password, user.get("encryption_salt", "")))
+        private_pem = locker.decrypt(user.get("encrypted_private_key", "").encode("ascii"))
+        private_key = serialization.load_pem_private_key(private_pem, password=None)
+    except (InvalidToken, ValueError, TypeError, UnicodeEncodeError):
+        return False
+    st.session_state.setdefault("private_keys", {})[username] = private_key
+    return True
+
+
+def current_private_key(username: str) -> Any | None:
+    return st.session_state.get("private_keys", {}).get(username)
+
+
+def encrypt_for_member(username: str, payload: bytes) -> str:
+    user = get_user(username)
+    public_pem = user.get("public_key", "") if user else ""
+    if not public_pem or not crypto_available():
+        return ""
+    try:
+        public_key = serialization.load_pem_public_key(public_pem.encode("ascii"))
+        encrypted = public_key.encrypt(
+            payload,
+            asymmetric_padding.OAEP(
+                mgf=asymmetric_padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+        return base64.b64encode(encrypted).decode("ascii")
+    except (ValueError, TypeError, UnicodeEncodeError):
+        return ""
+
+
+def decrypt_for_member(username: str, encrypted_payload: str) -> bytes:
+    private_key = current_private_key(username)
+    if not private_key or not encrypted_payload or not crypto_available():
+        return b""
+    try:
+        return private_key.decrypt(
+            base64.b64decode(encrypted_payload),
+            asymmetric_padding.OAEP(
+                mgf=asymmetric_padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+    except (binascii.Error, ValueError, TypeError):
+        return b""
+
+
+def conversation_key_record(conversation_id: str, key_bytes: bytes, members: list[str], key_id: str | None = None) -> dict[str, Any]:
+    key_id = key_id or uuid.uuid4().hex
+    envelopes = {
+        member: envelope
+        for member in members
+        if (envelope := encrypt_for_member(member, key_bytes))
+    }
+    return {
+        "id": key_id,
+        "algorithm": "rsa-oaep-fernet-v1",
+        "created_at": current_stamp(),
+        "updated_at": current_stamp(),
+        "members": envelopes,
+    }
+
+
+def conversation_key_bundle(conversation_id: str) -> dict[str, Any] | None:
+    key_store = st.session_state.data.setdefault("conversation_keys", {})
+    bundle = key_store.get(conversation_id)
+    if not bundle:
+        return None
+    if "keys" not in bundle:
+        key_id = bundle.get("id") or "legacy"
+        bundle["id"] = key_id
+        key_store[conversation_id] = {"active_key_id": key_id, "keys": {key_id: bundle}}
+    return key_store.get(conversation_id)
+
+
+def conversation_key_for_user(
+    conversation_id: str,
+    username: str,
+    create: bool = False,
+    key_id: str | None = None,
+) -> tuple[bytes, str]:
+    if not crypto_available():
+        return b"", ""
+    key_store = st.session_state.data.setdefault("conversation_keys", {})
+    bundle = conversation_key_bundle(conversation_id)
+    key_bytes = b""
+    resolved_key_id = ""
+    if bundle:
+        resolved_key_id = key_id or bundle.get("active_key_id", "")
+        record = bundle.get("keys", {}).get(resolved_key_id, {})
+        key_bytes = decrypt_for_member(username, record.get("members", {}).get(username, ""))
+    elif create:
+        resolved_key_id = uuid.uuid4().hex
+        key_bytes = Fernet.generate_key()
+        record = conversation_key_record(
+            conversation_id,
+            key_bytes,
+            conversation_members_from_data(st.session_state.data, conversation_id),
+            resolved_key_id,
+        )
+        key_store[conversation_id] = {"active_key_id": resolved_key_id, "keys": {resolved_key_id: record}}
+        bundle = key_store[conversation_id]
+
+    if create and bundle and not key_bytes:
+        resolved_key_id = uuid.uuid4().hex
+        key_bytes = Fernet.generate_key()
+        record = conversation_key_record(
+            conversation_id,
+            key_bytes,
+            conversation_members_from_data(st.session_state.data, conversation_id),
+            resolved_key_id,
+        )
+        bundle.setdefault("keys", {})[resolved_key_id] = record
+        bundle["active_key_id"] = resolved_key_id
+
+    if create and bundle and key_bytes:
+        changed = False
+        record = bundle.setdefault("keys", {}).setdefault(
+            resolved_key_id,
+            conversation_key_record(conversation_id, key_bytes, [], resolved_key_id),
+        )
+        envelopes = record.setdefault("members", {})
+        for member in conversation_members_from_data(st.session_state.data, conversation_id):
+            if member not in envelopes:
+                envelope = encrypt_for_member(member, key_bytes)
+                if envelope:
+                    envelopes[member] = envelope
+                    changed = True
+        if changed:
+            record["updated_at"] = current_stamp()
+    return key_bytes, resolved_key_id
+
+
+def conversation_cipher(
+    conversation_id: str,
+    create: bool = False,
+    key_id: str | None = None,
+) -> tuple[Any | None, str]:
+    username = st.session_state.get("current_user", "")
+    key_bytes, resolved_key_id = conversation_key_for_user(conversation_id, username, create=create, key_id=key_id) if username else (b"", "")
+    return (Fernet(key_bytes), resolved_key_id) if key_bytes and Fernet else (None, resolved_key_id)
+
+
+def members_missing_public_keys(conversation_id: str) -> list[str]:
+    missing = []
+    for member in conversation_members_from_data(st.session_state.data, conversation_id):
+        user = get_user(member)
+        if not user or not user.get("public_key"):
+            missing.append(member)
+    return missing
+
+
+def create_fresh_conversation_cipher(conversation_id: str) -> tuple[Any | None, str]:
+    if not crypto_available():
+        return None, ""
+    key_bytes = Fernet.generate_key()
+    key_id = uuid.uuid4().hex
+    record = conversation_key_record(
+        conversation_id,
+        key_bytes,
+        conversation_members_from_data(st.session_state.data, conversation_id),
+        key_id,
+    )
+    bundle = conversation_key_bundle(conversation_id)
+    if not bundle:
+        st.session_state.data.setdefault("conversation_keys", {})[conversation_id] = {
+            "active_key_id": key_id,
+            "keys": {key_id: record},
+        }
+    else:
+        bundle.setdefault("keys", {})[key_id] = record
+        bundle["active_key_id"] = key_id
+    return Fernet(key_bytes), key_id
+
+
+def legacy_chat_cipher(conversation_id: str, key_version: int | None = None) -> Any | None:
     if not Fernet:
         return None
     if key_version is None:
@@ -310,9 +593,12 @@ def chat_cipher(conversation_id: str, key_version: int | None = None) -> Any | N
 
 
 def encryption_status_label() -> str:
-    if not Fernet:
+    if not crypto_available():
         return "Encryption unavailable"
-    return f"End-to-end encrypted chats v{active_encryption_version()}"
+    current_user = st.session_state.get("current_user", "")
+    if current_user and current_private_key(current_user):
+        return f"End-to-end encrypted storage v{active_encryption_version()}"
+    return "Encryption locked"
 
 
 def encrypted_message_payload(
@@ -320,12 +606,20 @@ def encrypted_message_payload(
     text: str,
     key_version: int | None = None,
 ) -> dict[str, Any]:
+    cipher, conversation_key_id = conversation_cipher(conversation_id, create=True)
+    return encrypted_payload_with_cipher(text, active_encryption_version() if key_version is None else key_version, cipher, conversation_key_id)
+
+
+def encrypted_payload_with_cipher(
+    text: str,
+    key_version: int,
+    cipher: Any | None,
+    conversation_key_id: str = "",
+) -> dict[str, Any]:
     raw = text.encode("utf-8")
     compressed = zlib.compress(raw, level=6)
     use_compression = len(compressed) + 12 < len(raw)
     payload = compressed if use_compression else raw
-    key_version = active_encryption_version() if key_version is None else key_version
-    cipher = chat_cipher(conversation_id, key_version)
     if not cipher:
         if use_compression:
             return {
@@ -340,8 +634,9 @@ def encrypted_message_payload(
         "ciphertext": token,
         "encrypted": True,
         "compressed": use_compression,
-        "algorithm": "fernet-chat-key-v2",
+        "algorithm": "recipient-envelope-fernet-v1",
         "key_version": key_version,
+        "conversation_key_id": conversation_key_id,
     }
 
 
@@ -357,7 +652,10 @@ def message_text(conversation_id: str, message: dict[str, Any]) -> str:
                 return "Compressed message could not be decoded"
         return message.get("text", "")
 
-    cipher = chat_cipher(conversation_id, safe_int(message.get("key_version"), 0))
+    if message.get("algorithm") == "recipient-envelope-fernet-v1":
+        cipher, _ = conversation_cipher(conversation_id, create=False, key_id=message.get("conversation_key_id"))
+    else:
+        cipher = legacy_chat_cipher(conversation_id, safe_int(message.get("key_version"), 0))
     if not cipher:
         return "Encrypted message unavailable"
     try:
@@ -418,10 +716,15 @@ def make_user(
     email: str | None = None,
     friends: list[str] | None = None,
 ) -> dict[str, Any]:
+    encryption_salt = uuid.uuid4().hex
+    encryption_identity = generate_user_encryption_identity(username, password, encryption_salt)
     return {
         "username": username,
         "display_name": display_name.strip() or username,
         "password_hash": password_hash(username, password),
+        "encryption_salt": encryption_salt,
+        "public_key": encryption_identity.get("public_key", ""),
+        "encrypted_private_key": encryption_identity.get("encrypted_private_key", ""),
         "status": "available",
         "accent": accent_for_username(username),
         "accent_color": "#04986d",
@@ -555,6 +858,7 @@ def ensure_data_shape(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("moderation_queue", [])
     data.setdefault("push_notifications", [])
     data.setdefault("offline_queue", {})
+    data.setdefault("conversation_keys", {})
     encryption = data.setdefault("encryption", {})
     encryption.setdefault("active_key_version", 1)
     encryption.setdefault("rotations", [])
@@ -593,6 +897,9 @@ def ensure_data_shape(data: dict[str, Any]) -> dict[str, Any]:
         user.setdefault("last_seen_at", "")
         user.setdefault("online_until", "")
         user.setdefault("password_reset", {})
+        user.setdefault("encryption_salt", uuid.uuid4().hex)
+        user.setdefault("public_key", "")
+        user.setdefault("encrypted_private_key", "")
 
     for group_id, group in data["groups"].items():
         group.setdefault("id", group_id)
@@ -642,26 +949,28 @@ def ensure_data_shape(data: dict[str, Any]) -> dict[str, Any]:
             message.setdefault("moderation_flags", [])
             message.setdefault("spam_score", 0)
             message.setdefault("compressed", False)
+            message.setdefault("conversation_key_id", "")
             if message.get("encrypted"):
                 message.setdefault("key_version", 0)
             else:
-                message.setdefault("key_version", active_encryption_version(data))
-            message.setdefault("delivered_to", [member for member in members if member != sender])
+                message.setdefault("encrypted", False)
+                message.setdefault("key_version", 0)
+            message.setdefault(
+                "delivered_to",
+                [member for member in members if member != sender and member in message.get("read_by", [])],
+            )
             if previous_version < 3:
                 message.setdefault("read_by", members)
             else:
                 message.setdefault("read_by", [sender])
             message["state"] = message_state_from_lists(message, members)
-            if message.get("encrypted") or "text" not in message or message.get("deleted"):
-                continue
-            plaintext = message.pop("text", "")
-            message.update(encrypted_message_payload(conversation_id, plaintext, active_encryption_version(data)))
-            message["state"] = message_state_from_lists(message, members)
 
     for attachment_hash, asset in data["attachments"].items():
         asset.setdefault("hash", attachment_hash)
-        asset.setdefault("storage_backend", OBJECT_STORAGE_PROVIDER)
+        if "storage_backend" not in asset:
+            asset["storage_backend"] = "local" if asset.get("payload") else OBJECT_STORAGE_PROVIDER
         asset.setdefault("object_key", "")
+        asset.setdefault("object_size", 0)
         asset.setdefault("scan_status", "clean")
         asset.setdefault("thumbnail_data_uri", "")
 
@@ -699,6 +1008,10 @@ def selected_backend() -> str:
     if DATABASE_URL.startswith(("postgresql://", "postgres://")):
         return "postgres"
     return "sqlite"
+
+
+def active_storage_backend() -> str:
+    return getattr(st.session_state, "storage_backend_active", selected_backend())
 
 
 def sqlite_path() -> Path:
@@ -810,6 +1123,7 @@ def load_data() -> dict[str, Any]:
     if not loaded and save_backend == "sqlite":
         loaded = read_json_state()
     shaped_data = ensure_data_shape(loaded or build_seed_data())
+    st.session_state.storage_backend_active = save_backend
     try:
         save_data(shaped_data, backend=save_backend)
     except Exception as exc:
@@ -818,7 +1132,7 @@ def load_data() -> dict[str, Any]:
 
 
 def save_data(data: dict[str, Any], backend: str | None = None) -> None:
-    backend = backend or selected_backend()
+    backend = backend or active_storage_backend()
     if backend == "json":
         write_json_state(data)
     elif backend == "postgres":
@@ -1071,6 +1385,80 @@ def send_push_notification(username: str, title: str, body: str, conversation_id
     )
 
 
+def realtime_ws_url(conversation_id: str) -> str:
+    if not REALTIME_WS_URL:
+        return ""
+    return f"{REALTIME_WS_URL}/{quote(conversation_id, safe='')}"
+
+
+def realtime_publish_url(conversation_id: str) -> str:
+    if not REALTIME_WS_URL:
+        return ""
+    if REALTIME_WS_URL.startswith("wss://"):
+        base = "https://" + REALTIME_WS_URL.removeprefix("wss://")
+    elif REALTIME_WS_URL.startswith("ws://"):
+        base = "http://" + REALTIME_WS_URL.removeprefix("ws://")
+    else:
+        base = REALTIME_WS_URL
+    if base.endswith("/ws"):
+        base = base[:-3] + "/publish"
+    else:
+        base = f"{base.rstrip('/')}/publish"
+    return f"{base}/{quote(conversation_id, safe='')}"
+
+
+def notify_realtime_event(conversation_id: str, event_type: str, actor: str, message_id: str = "") -> None:
+    publish_url = realtime_publish_url(conversation_id)
+    if not publish_url:
+        return
+    try:
+        requests = importlib.import_module("requests")
+        requests.post(
+            publish_url,
+            json={
+                "event": event_type,
+                "actor": actor,
+                "message_id": message_id,
+                "created_at": current_stamp(),
+            },
+            timeout=2,
+        )
+    except Exception:
+        return
+
+
+def render_realtime_bridge(conversation_id: str, current_user: str) -> None:
+    ws_url = realtime_ws_url(conversation_id)
+    if not ws_url or components is None:
+        return
+    components.html(
+        f"""
+        <script>
+        (() => {{
+          const wsUrl = {json.dumps(ws_url)};
+          const currentUser = {json.dumps(current_user)};
+          const key = "chatlite-realtime-" + wsUrl;
+          if (window.parent[key]) {{
+            try {{ window.parent[key].close(); }} catch (error) {{}}
+          }}
+          const socket = new WebSocket(wsUrl);
+          window.parent[key] = socket;
+          socket.onmessage = (event) => {{
+            try {{
+              const envelope = JSON.parse(event.data || "{{}}");
+              const payload = JSON.parse(envelope.payload || "{{}}");
+              if (payload.actor && payload.actor !== currentUser) {{
+                setTimeout(() => window.parent.location.reload(), 350);
+              }}
+            }} catch (error) {{}}
+          }};
+        }})();
+        </script>
+        """,
+        height=1,
+    )
+
+
 def send_reset_email(email_value: str, code: str) -> bool:
     if not (SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD):
         return False
@@ -1083,7 +1471,7 @@ def send_reset_email(email_value: str, code: str) -> bool:
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
         smtp.starttls(context=context)
         smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-    smtp.send_message(message)
+        smtp.send_message(message)
     return True
 
 
@@ -1135,6 +1523,14 @@ def logout_all_devices(username: str) -> None:
         session["active"] = False
         session["ended_at"] = current_stamp()
     save_data(st.session_state.data)
+
+
+def current_session_is_active(username: str) -> bool:
+    session_id = st.session_state.get("current_session_id", "")
+    if not session_id:
+        return False
+    sessions = st.session_state.data.setdefault("device_sessions", {}).setdefault(username, [])
+    return any(session.get("id") == session_id and session.get("active") for session in sessions)
 
 
 def start_call(username: str, conversation_id: str, call_type: str) -> tuple[bool, str]:
@@ -1532,26 +1928,73 @@ def upload_object_storage(object_key: str, payload: bytes, mime_type: str) -> tu
         return "", ""
 
 
-def store_attachment_asset(file_bytes: bytes, mime_type: str) -> tuple[str, bool, int]:
+def download_object_storage(asset: dict[str, Any]) -> bytes:
+    object_backend = asset.get("storage_backend", "")
+    object_key = asset.get("object_key", "")
+    if object_backend not in {"s3", "minio"} or not OBJECT_STORAGE_BUCKET or not object_key:
+        return b""
+    try:
+        if object_backend == "s3":
+            boto3 = importlib.import_module("boto3")
+            client_kwargs = {}
+            if OBJECT_STORAGE_ENDPOINT:
+                client_kwargs["endpoint_url"] = OBJECT_STORAGE_ENDPOINT
+            s3 = boto3.client("s3", **client_kwargs)
+            response = s3.get_object(Bucket=OBJECT_STORAGE_BUCKET, Key=object_key)
+            return response["Body"].read()
+
+        minio_module = importlib.import_module("minio")
+        Minio = getattr(minio_module, "Minio")
+        endpoint = OBJECT_STORAGE_ENDPOINT.replace("https://", "").replace("http://", "")
+        minio_client = Minio(
+            endpoint,
+            access_key=OBJECT_STORAGE_ACCESS_KEY,
+            secret_key=OBJECT_STORAGE_SECRET_KEY,
+            secure=OBJECT_STORAGE_ENDPOINT.startswith("https://"),
+        )
+        response = minio_client.get_object(OBJECT_STORAGE_BUCKET, object_key)
+        try:
+            return response.read()
+        finally:
+            close = getattr(response, "close", None)
+            release_conn = getattr(response, "release_conn", None)
+            if close:
+                close()
+            if release_conn:
+                release_conn()
+    except Exception:
+        return b""
+
+
+def store_attachment_asset(file_bytes: bytes, mime_type: str) -> tuple[str, bool, int, str, str]:
     digest = hashlib.sha256(file_bytes).hexdigest()
     compressed, payload = compress_bytes(file_bytes)
     object_backend, object_key = upload_object_storage(f"attachments/{digest}", payload, mime_type)
     assets = st.session_state.data.setdefault("attachments", {})
     if digest not in assets:
+        stored_in_database = not object_backend
         assets[digest] = {
             "hash": digest,
             "mime_type": mime_type,
             "size": len(file_bytes),
-            "stored_size": len(payload),
+            "stored_size": len(payload) if stored_in_database else 0,
+            "object_size": len(payload) if object_backend else 0,
             "compressed": compressed,
-            "payload": base64.b64encode(payload).decode("ascii"),
+            "payload": base64.b64encode(payload).decode("ascii") if stored_in_database else "",
             "created_at": current_stamp(),
             "ref_count": 0,
             "storage_backend": object_backend or "local",
             "object_key": object_key,
         }
     assets[digest]["ref_count"] = safe_int(assets[digest].get("ref_count"), 0) + 1
-    return digest, bool(assets[digest].get("compressed")), safe_int(assets[digest].get("stored_size"), len(file_bytes))
+    asset = assets[digest]
+    return (
+        digest,
+        bool(asset.get("compressed")),
+        safe_int(asset.get("stored_size"), len(file_bytes)),
+        asset.get("storage_backend", "local"),
+        asset.get("object_key", ""),
+    )
 
 
 def attachment_data_uri(attachment: dict[str, Any]) -> str:
@@ -1562,7 +2005,12 @@ def attachment_data_uri(attachment: dict[str, Any]) -> str:
     if not asset:
         return ""
     try:
-        payload = base64.b64decode(asset.get("payload", ""))
+        if asset.get("payload"):
+            payload = base64.b64decode(asset.get("payload", ""))
+        else:
+            payload = download_object_storage(asset)
+            if not payload:
+                return ""
         if asset.get("compressed"):
             payload = zlib.decompress(payload)
         encoded = base64.b64encode(payload).decode("ascii")
@@ -1852,22 +2300,36 @@ def restore_backup(backup_id: str) -> tuple[bool, str]:
 
 
 def rotate_encryption_keys() -> tuple[bool, str]:
-    if not Fernet:
+    if not crypto_available():
         return False, "Install cryptography to rotate encryption keys."
+    current_user = st.session_state.get("current_user", "")
+    if not current_user or not current_private_key(current_user):
+        return False, "Encryption key is locked. Log in again to rotate keys."
     old_version = active_encryption_version()
     new_version = old_version + 1
     rotated = 0
     for conversation_id, messages in st.session_state.data.get("messages", {}).items():
+        members = conversation_members(conversation_id)
+        if current_user not in members or members_missing_public_keys(conversation_id):
+            continue
+        readable_messages = []
         for message in messages:
             if message.get("deleted"):
                 continue
             plaintext = message_text(conversation_id, message)
             if plaintext in MESSAGE_TEXT_FAILURES:
                 continue
+            readable_messages.append((message, plaintext))
+        if not readable_messages:
+            continue
+        fresh_cipher, fresh_key_id = create_fresh_conversation_cipher(conversation_id)
+        if not fresh_cipher:
+            continue
+        for message, plaintext in readable_messages:
             message.pop("text", None)
             message.pop("text_payload", None)
             message.pop("ciphertext", None)
-            message.update(encrypted_message_payload(conversation_id, plaintext, key_version=new_version))
+            message.update(encrypted_payload_with_cipher(plaintext, new_version, fresh_cipher, fresh_key_id))
             rotated += 1
     encryption = st.session_state.data.setdefault("encryption", {})
     encryption["active_key_version"] = new_version
@@ -2011,7 +2473,7 @@ def uploaded_file_to_attachment(uploaded_file: Any) -> tuple[bool, dict[str, Any
     scan_status, scan_issues = scan_attachment_bytes(file_bytes, uploaded_file.name, mime_type)
     if scan_status == "blocked":
         return False, f"{uploaded_file.name} blocked by media scan: {', '.join(scan_issues)}."
-    asset_hash, compressed, stored_size = store_attachment_asset(file_bytes, mime_type)
+    asset_hash, compressed, stored_size, storage_backend, object_key = store_attachment_asset(file_bytes, mime_type)
     category = "file"
     if mime_type.startswith("image/"):
         category = "image"
@@ -2030,8 +2492,9 @@ def uploaded_file_to_attachment(uploaded_file: Any) -> tuple[bool, dict[str, Any
         "scan_status": scan_status,
         "scan_issues": scan_issues,
         "thumbnail_data_uri": thumbnail_for_attachment(file_bytes, mime_type),
-        "storage_backend": OBJECT_STORAGE_PROVIDER,
+        "storage_backend": storage_backend,
         "object_bucket": OBJECT_STORAGE_BUCKET,
+        "object_key": object_key,
         "category": category,
     }
 
@@ -2313,13 +2776,32 @@ def total_unread(username: str) -> int:
 def mark_conversation_read(username: str, conversation_id: str) -> None:
     changed = False
     for message in st.session_state.data["messages"].get(conversation_id, []):
-        if message.get("sender") == username or username in message.get("read_by", []):
+        if message.get("sender") == username:
+            continue
+        if username not in message.get("delivered_to", []):
+            message["delivered_to"] = sorted(set(message.get("delivered_to", [])) | {username})
+            changed = True
+        if username in message.get("read_by", []):
             continue
         message["read_by"] = sorted(set(message.get("read_by", [])) | {username})
         message["state"] = message_state_from_lists(message, conversation_members(conversation_id))
         changed = True
     if changed:
         save_data(st.session_state.data)
+        notify_realtime_event(conversation_id, "read", username)
+
+
+def mark_conversation_delivered(username: str, conversation_id: str) -> None:
+    changed = False
+    for message in st.session_state.data["messages"].get(conversation_id, []):
+        if message.get("sender") == username or username in message.get("delivered_to", []):
+            continue
+        message["delivered_to"] = sorted(set(message.get("delivered_to", [])) | {username})
+        message["state"] = message_state_from_lists(message, conversation_members(conversation_id))
+        changed = True
+    if changed:
+        save_data(st.session_state.data)
+        notify_realtime_event(conversation_id, "delivered", username)
 
 
 def is_pinned(user: dict[str, Any], conversation_id: str) -> bool:
@@ -2379,6 +2861,13 @@ def add_message_to_conversation(
             return False, "You are muted or not allowed to send messages in this group."
     if sender not in members:
         return False, "You are not a member of this chat."
+    if crypto_available():
+        if not current_private_key(sender):
+            return False, "Encryption key is locked. Log in again to unlock secure messaging."
+        missing_keys = members_missing_public_keys(conversation_id)
+        if missing_keys:
+            missing_label = ", ".join(f"@{member}" for member in missing_keys[:4])
+            return False, f"Secure messaging is waiting for encryption keys from {missing_label}. Ask them to log in once."
 
     if not skip_rate_limit:
         allowed, rate_message = check_rate_limit(f"{sender}:{conversation_id}", "message")
@@ -2400,7 +2889,7 @@ def add_message_to_conversation(
     if toxic_score >= 50:
         moderation_flags.append(f"Toxicity score {toxic_score}")
     update_user_reputation(sender, spam_score, moderation_flags)
-    delivered_to = [member for member in members if member != sender]
+    recipients = [member for member in members if member != sender]
     message_id = str(uuid.uuid4())
     message = {
         "id": message_id,
@@ -2415,8 +2904,8 @@ def add_message_to_conversation(
         "forwarded_from": forwarded_from,
         "attachments": attachments,
         "read_by": [sender],
-        "delivered_to": delivered_to,
-        "state": "delivered" if delivered_to else "sent",
+        "delivered_to": [],
+        "state": "sent",
         "moderation_flags": moderation_flags,
         "spam_score": spam_score,
         "toxicity_score": toxic_score,
@@ -2441,7 +2930,7 @@ def add_message_to_conversation(
                 "status": "open",
             }
         )
-    for member in delivered_to:
+    for member in recipients:
         send_push_notification(member, "New ChatLite message", latest_message(member, conversation_id), conversation_id)
         member_user = get_user(member)
         online_until = parse_stamp(member_user.get("online_until")) if member_user else None
@@ -2458,6 +2947,7 @@ def add_message_to_conversation(
             )
     clear_typing(sender, conversation_id)
     save_data(st.session_state.data)
+    notify_realtime_event(conversation_id, "message", sender, message_id)
     return True, "Message sent."
 
 
@@ -2465,6 +2955,8 @@ def edit_message(conversation_id: str, message_id: str, new_text: str, editor: s
     cleaned = new_text.strip()
     if not cleaned:
         return False, "Message text cannot be empty."
+    if crypto_available() and not current_private_key(editor):
+        return False, "Encryption key is locked. Log in again to edit secure messages."
     content_issues = detect_content_issues(cleaned)
     blocking_issues = [issue["label"] for issue in content_issues if issue["severity"] == "block"]
     if blocking_issues:
@@ -2481,6 +2973,7 @@ def edit_message(conversation_id: str, message_id: str, new_text: str, editor: s
             message["topic_labels"] = topic_labels_for_text(cleaned)
             message["moderation_flags"] = [issue["label"] for issue in content_issues]
             save_data(st.session_state.data)
+            notify_realtime_event(conversation_id, "edit", editor, message_id)
             return True, "Message edited."
     return False, "Message not found."
 
@@ -2497,6 +2990,7 @@ def delete_message(conversation_id: str, message_id: str, editor: str) -> tuple[
             message.pop("text_payload", None)
             message.pop("ciphertext", None)
             save_data(st.session_state.data)
+            notify_realtime_event(conversation_id, "delete", editor, message_id)
             return True, "Message deleted."
     return False, "Message not found."
 
@@ -2636,6 +3130,7 @@ def complete_password_reset(email_value: str, code: str, new_password: str, conf
     if new_password != confirm_password:
         return False, "Passwords do not match."
     user["password_hash"] = password_hash(username, new_password)
+    reset_user_encryption_identity(username, new_password)
     user["password_reset"] = {}
     clear_rate_limit(email, "password_reset")
     clear_rate_limit(f"{email}:complete", "password_reset")
@@ -2668,6 +3163,7 @@ def create_account(
     st.session_state.data["users"][username] = make_user(username, display_name, password, email)
     save_data(st.session_state.data)
     st.session_state.current_user = username
+    unlock_user_private_key(username, password)
     st.session_state.current_session_id = create_device_session(username)
     st.session_state.active_friend = None
     st.session_state.active_group = None
@@ -2686,6 +3182,8 @@ def login(email_value: str, password: str) -> tuple[bool, str]:
         return False, "Invalid mail ID or password."
 
     clear_rate_limit(email, "login")
+    if crypto_available() and not unlock_user_private_key(username, password):
+        return False, "Encryption key could not be unlocked for this account."
     anomaly_flags = detect_login_anomaly(user)
     st.session_state.current_user = username
     st.session_state.current_session_id = create_device_session(username)
@@ -3767,9 +4265,9 @@ def render_profile_editor(current_user: str) -> None:
                 else 0,
                 key=f"profile_accent_{current_user}",
             )
-            uploaded_photo = st.file_uploader(
+            uploaded_photo = file_uploader_compat(
                 "Profile photo",
-                type=["jpg", "jpeg", "png", "webp"],
+                file_types=["jpg", "jpeg", "png", "webp"],
                 accept_multiple_files=False,
                 max_upload_size=2,
                 key=f"profile_photo_{current_user}",
@@ -3871,9 +4369,9 @@ def render_group_creator(current_user: str) -> None:
                 friend_names,
                 format_func=lambda name: get_user(name)["display_name"] if get_user(name) else name,
             )
-            group_photo = st.file_uploader(
+            group_photo = file_uploader_compat(
                 "Group photo",
-                type=["jpg", "jpeg", "png", "webp"],
+                file_types=["jpg", "jpeg", "png", "webp"],
                 accept_multiple_files=False,
                 max_upload_size=2,
                 key=f"group_photo_{current_user}",
@@ -3896,7 +4394,7 @@ def render_security_backup_tools(current_user: str) -> None:
             for asset in assets.values()
         )
         st.caption(
-            f"{selected_backend().upper()} storage | {len(assets)} unique attachment(s) | "
+            f"{active_storage_backend().upper()} storage | {len(assets)} unique attachment(s) | "
             f"{saved_bytes // 1024} KB saved"
         )
         rotations = st.session_state.data.get("encryption", {}).get("rotations", [])
@@ -4478,9 +4976,9 @@ def render_composer(current_user: str, conversation_id: str, disabled: bool = Fa
                 key=f"send_{key}",
                 disabled=disabled,
             )
-        uploads = st.file_uploader(
+        uploads = file_uploader_compat(
             "Attach media or files",
-            type=MEDIA_EXTENSIONS,
+            file_types=MEDIA_EXTENSIONS,
             accept_multiple_files=True,
             max_upload_size=upload_limit_mb(),
             key=f"media_{key}_{st.session_state[upload_nonce_key]}",
@@ -4706,8 +5204,19 @@ def initialize_state() -> None:
     if not current_user:
         return
 
+    if not current_session_is_active(current_user):
+        st.session_state.current_user = None
+        st.session_state.current_session_id = None
+        st.session_state.active_friend = None
+        st.session_state.active_group = None
+        st.query_params.clear()
+        st.warning("This session was logged out from another device.")
+        return
+
     touch_presence(current_user)
     flush_offline_queue(current_user)
+    for item in chat_items(current_user, show_archived=True):
+        mark_conversation_delivered(current_user, item["conversation_id"])
     friends = {friend["username"] for friend in sorted_friend_users(current_user)}
     groups = {
         group_id
@@ -4782,6 +5291,7 @@ def render_chat_app() -> None:
         disabled = blocked_between(current_user, friend_username)
 
     with st.container(key="chat-shell"):
+        render_realtime_bridge(conversation_id, current_user)
         render_header(title, subtitle, avatar, conversation_id, current_user)
         search_term = render_chat_tools(current_user, conversation_id, friend_username, group_id)
         render_messages(current_user, conversation_id, search_term)

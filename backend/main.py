@@ -7,7 +7,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 
 try:
     import redis.asyncio as redis
@@ -27,6 +27,20 @@ async def redis_client() -> Any | None:
     return redis.from_url(REDIS_URL, decode_responses=True)
 
 
+async def broadcast_event(conversation_id: str, encoded: str, client: Any | None = None) -> None:
+    if client:
+        await client.publish(f"chatlite:{conversation_id}", encoded)
+        return
+    disconnected = []
+    for peer in local_channels[conversation_id]:
+        try:
+            await peer.send_text(encoded)
+        except RuntimeError:
+            disconnected.append(peer)
+    for peer in disconnected:
+        local_channels[conversation_id].discard(peer)
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {
@@ -34,6 +48,23 @@ async def health() -> dict[str, str]:
         "redis": "enabled" if REDIS_URL else "disabled",
         "time": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
+
+
+@app.post("/publish/{conversation_id}")
+async def publish(conversation_id: str, request: Request) -> dict[str, str]:
+    payload = await request.json()
+    event = {
+        "conversation_id": conversation_id,
+        "payload": json.dumps(payload),
+        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    client = await redis_client()
+    try:
+        await broadcast_event(conversation_id, json.dumps(event), client)
+    finally:
+        if client:
+            await client.close()
+    return {"status": "published"}
 
 
 @app.websocket("/ws/{conversation_id}")
@@ -71,17 +102,7 @@ async def websocket_chat(websocket: WebSocket, conversation_id: str) -> None:
                 "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             }
             encoded = json.dumps(event)
-            if client:
-                await client.publish(f"chatlite:{conversation_id}", encoded)
-            else:
-                disconnected = []
-                for peer in local_channels[conversation_id]:
-                    try:
-                        await peer.send_text(encoded)
-                    except RuntimeError:
-                        disconnected.append(peer)
-                for peer in disconnected:
-                    local_channels[conversation_id].discard(peer)
+            await broadcast_event(conversation_id, encoded, client)
     except WebSocketDisconnect:
         pass
     finally:

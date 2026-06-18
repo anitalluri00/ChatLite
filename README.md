@@ -12,6 +12,7 @@ SQLite/PostgreSQL-ready storage.
 - Private chats between accepted friends
 - Group chats with admin member management
 - Encrypted message storage for chats
+- Recipient-key encrypted storage for new messages
 - Encryption key rotation with legacy-message readability
 - Unread message badges
 - Online, offline, and last-seen status
@@ -156,7 +157,14 @@ Run the FastAPI WebSocket backend:
 python3 -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
 ```
 
-With Redis pub/sub:
+Connect the Streamlit UI to the realtime backend:
+
+```bash
+export CHATLITE_REALTIME_WS_URL="ws://localhost:8000/ws"
+python3 -m streamlit run app.py
+```
+
+With Redis pub/sub for multiple backend instances:
 
 ```bash
 export REDIS_URL="redis://localhost:6379/0"

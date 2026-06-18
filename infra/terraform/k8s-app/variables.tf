@@ -47,6 +47,12 @@ variable "database_url" {
   default     = null
 }
 
+variable "realtime_ws_url" {
+  description = "Optional ChatLite realtime WebSocket URL, for example ws://chatlite-realtime:8000/ws."
+  type        = string
+  default     = ""
+}
+
 variable "sqlite_storage_size" {
   description = "Persistent volume claim size for SQLite data."
   type        = string
