@@ -1,24 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 from collections import defaultdict
 from datetime import datetime
 from typing import Any
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+try:
+    fastapi_module = importlib.import_module("fastapi")
+except ImportError as exc:  # pragma: no cover - required runtime dependency
+    raise RuntimeError("Realtime backend requires FastAPI. Run: pip install -r requirements.txt") from exc
 
 try:
-    import redis.asyncio as redis
+    redis = importlib.import_module("redis.asyncio")
 except ImportError:  # pragma: no cover - optional runtime dependency
     redis = None
 
+FastAPI = getattr(fastapi_module, "FastAPI")
+WebSocketDisconnect = getattr(fastapi_module, "WebSocketDisconnect")
 
 REDIS_URL = os.getenv("REDIS_URL", "")
 
 app = FastAPI(title="ChatLite realtime backend")
-local_channels: dict[str, set[WebSocket]] = defaultdict(set)
+local_channels: dict[str, set[Any]] = defaultdict(set)
 
 
 async def redis_client() -> Any | None:
@@ -51,7 +57,7 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/publish/{conversation_id}")
-async def publish(conversation_id: str, request: Request) -> dict[str, str]:
+async def publish(conversation_id: str, request: Any) -> dict[str, str]:
     payload = await request.json()
     event = {
         "conversation_id": conversation_id,
@@ -68,7 +74,7 @@ async def publish(conversation_id: str, request: Request) -> dict[str, str]:
 
 
 @app.websocket("/ws/{conversation_id}")
-async def websocket_chat(websocket: WebSocket, conversation_id: str) -> None:
+async def websocket_chat(websocket: Any, conversation_id: str) -> None:
     await websocket.accept()
     local_channels[conversation_id].add(websocket)
     client = await redis_client()
